@@ -97,6 +97,8 @@ the following values for the :ref:`offload kind<table-offload_kind>` and the
     +---------------+-------+---------------------------------------+
     | IMG_PTX       | 0x05  | The image is a CUDA PTX file          |
     +---------------+-------+---------------------------------------+
+    | IMG_SPIRV     | 0x06  | The image is a SPIR-V file            |
+    +---------------+-------+---------------------------------------+
 
 .. table:: Offload Kind
     :name: table-offload_kind
@@ -111,6 +113,8 @@ the following values for the :ref:`offload kind<table-offload_kind>` and the
     | OFK_CUDA   | 0x02  | The producer was CUDA                 |
     +------------+-------+---------------------------------------+
     | OFK_HIP    | 0x03  | The producer was HIP                  |
+    +------------+-------+---------------------------------------+
+    | OFK_SYCL   | 0x04  | The producer was SYCL                 |
     +------------+-------+---------------------------------------+
 
 The flags are used to signify certain conditions, such as the presence of

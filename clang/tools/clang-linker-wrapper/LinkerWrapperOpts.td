@@ -119,3 +119,22 @@ def version : Flag<["--", "-"], "version">, Flags<[HelpHidden]>, Alias<v>;
 
 def whole_archive : Flag<["--", "-"], "whole-archive">, Flags<[HelpHidden]>;
 def no_whole_archive : Flag<["--", "-"], "no-whole-archive">, Flags<[HelpHidden]>;
+
+def sycl_device_lib_EQ : CommaJoined<["-"], "sycl-device-lib=">,
+  Values<"libc, libm-fp32, libm-fp64, libimf-fp32, libimf-fp64, libimf-bf16, all">,
+  HelpText<"Control inclusion of device libraries into device binary linkage."
+  "Valid arguments are libc, libm-fp32, libm-fp64, libimf-fp32, libimf-fp64,"
+  "libimf-bf16, all">;
+def no_sycl_device_lib_EQ : CommaJoined<["-"], "no-sycl-device-lib=">,
+  Values<"libc, libm-fp32, libm-fp64, all">, HelpText<"Control exclusion of "
+  "device libraries from device binary linkage. Valid arguments "
+  "are libc, libm-fp32, libm-fp64, all">;
+def sycl_device_library_path_EQ : CommaJoined<["-"], "sycl-device-library-path=">,
+  HelpText<"Location of SYCL device library files">;
+def sycl_bfloat_lib_EQ : Joined<["-"], "sycl-bfloat-lib=">,
+  Values<"native, fallback">,
+  HelpText<"Control inclusion of BFloat device libraries into device binary linkage."
+  "Valid arguments are native, fallback">;
+def sycl_instrument_device_code : Joined<["-"], "sycl-instrument-device-code">,
+  HelpText<"Technology (ITT) instrumentation intrinsics calls (experimental)">;
+def sycl : Flag<["--"], "sycl">, HelpText<"SYCL compilation flow">;

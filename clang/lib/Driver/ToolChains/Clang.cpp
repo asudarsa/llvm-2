@@ -10128,6 +10128,21 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
 
   CmdArgs.push_back(
       Args.MakeArgString("--host-triple=" + TheTriple.getTriple()));
+
+  // Pass the device triple to the linker wrapper tool for SYCL offload.
+  // Only the first triple is passed.
+  // TODO: Pass multiple triples if needed.
+  // Also, pass '-sycl' option to specify SYCL compilation.
+  if (Args.hasArg(options::OPT_fsycl)) {
+    auto TCRange = C.getOffloadToolChains(Action::OFK_SYCL);
+    for (auto &I : llvm::make_range(TCRange.first, TCRange.second)) {
+      const ToolChain *TC = I.second;
+      CmdArgs.push_back(Args.MakeArgString("--triple=" + TC->getTriple().str()));
+      break;
+    }
+    CmdArgs.push_back(Args.MakeArgString("--sycl"));
+  }
+
   if (Args.hasArg(options::OPT_v))
     CmdArgs.push_back("--wrapper-verbose");
 
