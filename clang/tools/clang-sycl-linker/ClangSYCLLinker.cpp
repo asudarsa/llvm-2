@@ -647,7 +647,7 @@ linkDeviceLibFiles(SmallVectorImpl<StringRef> &InputFiles,
 /// 'Args' encompasses all arguments required for linking and wrapping device
 /// code and will be parsed to generate options required to be passed into the
 /// llvm-link tool.
-static Expected<StringRef> linkDeviceBitcode(ArrayRef<std::string> InputFiles,
+static Expected<StringRef> linkDeviceBitcode(ArrayRef<StringRef> InputFiles,
                                              const ArgList &Args) {
   SmallVector<StringRef, 16> InputFilesVec;
   for (StringRef InputFile : InputFiles)
@@ -1175,7 +1175,7 @@ Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
   }
 }
 
-Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
+Error runSYCLLink(ArrayRef<StringRef> Files, const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCLDeviceLink");
   {
     // Link the input device files using the device linker for SYCL
@@ -1245,11 +1245,11 @@ Error runSYCLLink(ArrayRef<std::string> Files, const ArgList &Args) {
 
 } // namespace
 
-Expected<SmallVector<std::string>> getInput(const ArgList &Args) {
+Expected<SmallVector<StringRef>> getInput(const ArgList &Args) {
   // Collect all input bitcode files to be passed to the device linking stage.
-  SmallVector<std::string> BitcodeFiles;
+  SmallVector<StringRef> BitcodeFiles;
   for (const opt::Arg *Arg : Args.filtered(OPT_INPUT)) {
-    std::optional<std::string> Filename = std::string(Arg->getValue());
+    std::optional<StringRef> Filename = Arg->getValue();
     if (!Filename || !sys::fs::exists(*Filename) ||
         sys::fs::is_directory(*Filename))
       continue;
@@ -1299,17 +1299,6 @@ int main(int argc, char **argv) {
   OutputFile = "a.out";
   if (Args.hasArg(OPT_o))
     OutputFile = Args.getLastArgValue(OPT_o);
-
-  if (Args.hasArg(OPT_spirv_dump_device_code_EQ)) {
-    Arg *A = Args.getLastArg(OPT_spirv_dump_device_code_EQ);
-    SmallString<128> Dir(A->getValue());
-    if (Dir.empty())
-      llvm::sys::path::native(Dir = "./");
-    else
-      Dir.append(llvm::sys::path::get_separator());
-
-    SPIRVDumpDir = Dir;
-  }
 
   UseSYCLPostLinkTool = Args.hasFlag(OPT_use_sycl_post_link_tool,
                                      OPT_no_use_sycl_post_link_tool, true);
