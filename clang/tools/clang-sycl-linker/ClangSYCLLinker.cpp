@@ -78,6 +78,8 @@ static std::optional<llvm::module_split::IRSplitMode> SYCLModuleSplitMode;
 
 static SmallString<128> OffloadImageDumpDir;
 
+using OffloadingImage = OffloadBinary::OffloadingImage;
+
 static void printVersion(raw_ostream &OS) {
   OS << clang::getClangToolFullVersion("clang-sycl-linker") << '\n';
 }
@@ -217,8 +219,7 @@ Error executeCommands(StringRef ExecutablePath, ArrayRef<StringRef> Args) {
           "'%s' failed", sys::path::filename(ExecutablePath).str().c_str());
   return Error::success();
 }
-
-// end namespace
+} // end namespace
 
 namespace nvptx {
 Expected<StringRef>
@@ -485,6 +486,18 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args) {
 }
 } // namespace generic
 
+static Error writeFile(StringRef Filename, StringRef Data) {
+  Expected<std::unique_ptr<FileOutputBuffer>> OutputOrErr =
+      FileOutputBuffer::create(Filename, Data.size());
+  if (!OutputOrErr)
+    return OutputOrErr.takeError();
+  std::unique_ptr<FileOutputBuffer> Output = std::move(*OutputOrErr);
+  llvm::copy(Data, Output->getBufferStart());
+  if (Error E = Output->commit())
+    return E;
+  return Error::success();
+}
+
 Expected<StringRef> writeOffloadFile(const OffloadFile &File) {
   const OffloadBinary &Binary = *File.getBinary();
 
@@ -711,16 +724,8 @@ static Expected<StringRef> linkDeviceBitcode(ArrayRef<StringRef> InputFiles,
     }
   }
 
-  // Make sure that SYCL device library files are available.
-  // Note: For AMD targets, we do not pass any SYCL device libraries.
-  if (ExtractedDeviceLibFiles.empty()) {
-    // TODO: Add NVPTX when ready
-    if (Triple.isSPIROrSPIRV())
-      return createStringError(
-          inconvertibleErrorCode(),
-          " SYCL device library file list cannot be empty.");
+  if (ExtractedDeviceLibFiles.empty())
     return *LinkedFile;
-  }
 
   for (auto &File : ExtractedDeviceLibFiles)
     InputFilesVec.emplace_back(File);
@@ -1175,6 +1180,43 @@ Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
   }
 }
 
+Error writeSplitModulesToFile(ArrayRef<module_split::SplitModule> SplitModules,
+                              const ArgList &Args) {
+  SmallVector<char, 1024> BinaryData;
+  raw_svector_ostream OS(BinaryData);
+  std::mutex ImageMtx;
+  for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
+    auto File = SplitModules[I].ModuleFilePath;
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileOrErr =
+        llvm::MemoryBuffer::getFileOrSTDIN(File);
+    if (std::error_code EC = FileOrErr.getError()) {
+      if (DryRun)
+        FileOrErr = MemoryBuffer::getMemBuffer("");
+      else
+        return createFileError(File, EC);
+    }
+    std::scoped_lock<decltype(ImageMtx)> Guard(ImageMtx);
+    OffloadingImage TheImage{};
+    TheImage.TheImageKind = IMG_Object;
+    TheImage.TheOffloadKind = OFK_SYCL;
+    TheImage.StringData["triple"] =
+        Args.MakeArgString(Args.getLastArgValue(OPT_triple_EQ));
+    TheImage.StringData["arch"] =
+        Args.MakeArgString(Args.getLastArgValue(OPT_arch_EQ));
+    TheImage.Image = std::move(*FileOrErr);
+
+    llvm::SmallString<0> Buffer = OffloadBinary::write(TheImage);
+    if (Buffer.size() % OffloadBinary::getAlignment() != 0)
+      return createStringError(inconvertibleErrorCode(),
+                               "Offload binary has invalid size alignment");
+    OS << Buffer;
+  }
+  if (Error E = writeFile(OutputFile,
+                          StringRef(BinaryData.begin(), BinaryData.size())))
+    return E;
+  return Error::success();
+}
+
 Error runSYCLLink(ArrayRef<StringRef> Files, const ArgList &Args) {
   llvm::TimeTraceScope TimeScope("SYCLDeviceLink");
   {
@@ -1201,7 +1243,8 @@ Error runSYCLLink(ArrayRef<StringRef> Files, const ArgList &Args) {
       // of sycl-post-link (filetable referencing LLVM Bitcode + symbols)
       // through the offload wrapper and link the resulting object to the
       // application.
-      // ARV: Write SplitModules to file and exit
+      if (auto Err = writeSplitModulesToFile(SplitModules, Args))
+        return std::move(Err);
       return Error::success();
     }
     for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
@@ -1235,15 +1278,11 @@ Error runSYCLLink(ArrayRef<StringRef> Files, const ArgList &Args) {
         SplitModules[I].ModuleFilePath = *ClangOutputOrErr;
       }
     }
-
-    // ARV: Write SplitModules to file and exit
+    if (auto Err = writeSplitModulesToFile(SplitModules, Args))
+      return std::move(Err);
   }
-
-
   return Error::success();
 }
-
-} // namespace
 
 Expected<SmallVector<StringRef>> getInput(const ArgList &Args) {
   // Collect all input bitcode files to be passed to the device linking stage.
@@ -1289,6 +1328,8 @@ int main(int argc, char **argv) {
     return EXIT_SUCCESS;
   }
 
+  llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
+  llvm::errs() << "ARV: Triple = " << Triple.str() << "\n";
   if (Args.hasArg(OPT_version))
     printVersion(outs());
 

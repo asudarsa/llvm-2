@@ -24,10 +24,14 @@ def device_libs_EQ : CommaJoined<["--", "-"], "device-libs=">,
   Flags<[LinkerOnlyOption]>,
   HelpText<"A comma separated list of device libraries that are linked during the device link.">;
 
-def triple : Joined<["--"], "triple">,
-  HelpText<"The device target triple">;
-def arch : Separate<["--", "-"], "arch">,
-  HelpText<"Specify the name of the target architecture.">;
+def arch_EQ : Joined<["--", "-"], "arch=">,
+              Flags<[LinkerOnlyOption]>,
+              MetaVarName<"<arch>">,
+              HelpText<"The device architecture">;
+def triple_EQ : Joined<["--", "-"], "triple=">,
+                Flags<[LinkerOnlyOption]>,
+                MetaVarName<"<triple>">,
+                HelpText<"The device target triple">;
 
 def save_temps : Flag<["--", "-"], "save-temps">,
   Flags<[LinkerOnlyOption]>, HelpText<"Save intermediate results">;
@@ -89,14 +93,6 @@ def compression_level_eq : Joined<["--"], "compression-level=">,
                            HelpText<"Specify the compression level (integer)">;
 
 // Flags passed to the device linker.
-def arch_EQ : Joined<["--"], "arch=">,
-              Flags<[HelpHidden]>,
-              MetaVarName<"<arch>">,
-              HelpText<"The device subarchitecture">;
-def triple_EQ : Joined<["--"], "triple=">,
-                Flags<[HelpHidden]>,
-                MetaVarName<"<triple>">,
-                HelpText<"The device target triple">;
 def whole_program : Flag<["--"], "whole-program">,
                     Flags<[HelpHidden]>,
                     HelpText<"LTO has visibility of all input files">;
