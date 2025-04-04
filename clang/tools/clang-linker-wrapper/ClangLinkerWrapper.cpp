@@ -240,6 +240,31 @@ Expected<StringRef> createOutputFile(const Twine &Prefix, StringRef Extension) {
   return TempFiles.back();
 }
 
+Expected<StringRef> writeOffloadFile(const OffloadFile &File) {
+  const OffloadBinary &Binary = *File.getBinary();
+
+  StringRef Prefix =
+      sys::path::stem(Binary.getMemoryBufferRef().getBufferIdentifier());
+  SmallString<128> Filename;
+  (Prefix + "-" + Binary.getTriple() + "-" + Binary.getArch())
+      .toVector(Filename);
+  llvm::replace(Filename, ':', '-');
+  auto TempFileOrErr = createOutputFile(Filename, "o");
+  if (!TempFileOrErr)
+    return TempFileOrErr.takeError();
+
+  Expected<std::unique_ptr<FileOutputBuffer>> OutputOrErr =
+      FileOutputBuffer::create(*TempFileOrErr, Binary.getImage().size());
+  if (!OutputOrErr)
+    return OutputOrErr.takeError();
+  std::unique_ptr<FileOutputBuffer> Output = std::move(*OutputOrErr);
+  llvm::copy(Binary.getImage(), Output->getBufferStart());
+  if (Error E = Output->commit())
+    return std::move(E);
+
+  return *TempFileOrErr;
+}
+
 /// Execute the command \p ExecutablePath with the arguments \p Args.
 Error executeCommands(StringRef ExecutablePath, ArrayRef<StringRef> Args) {
   if (Verbose || DryRun)
@@ -554,6 +579,9 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
 
   if (Args.hasArg(OPT_embed_bitcode))
     CmdArgs.push_back("-Wl,--lto-emit-llvm");
+  
+  if (Verbose)
+    CmdArgs.push_back("-v");
 
   if (HasSYCLOffloadKind) {
     CmdArgs.push_back("--sycl-link");
@@ -567,7 +595,7 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
     if (DryRun)
       CmdArgs.append({"-Xlinker", Args.MakeArgString("--dry-run")});
     StringRef OptLevel = Args.getLastArgValue(OPT_opt_level, "O2");
-    CmdArgs.append({"-Xlinker", Args.MakeArgString("-O" + OptLevel)});
+    CmdArgs.append({"-Xlinker", Args.MakeArgString("-" + OptLevel)});
     StringRef GPUArgs = Args.getLastArgValue(OPT_gpu_tool_arg_EQ);
     CmdArgs.append(
         {"-Xlinker", Args.MakeArgString("-gpu-tool-arg=" + GPUArgs)});
@@ -610,31 +638,6 @@ Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
     return createStringError(Triple.getArchName() +
                              " linking is not supported");
   }
-}
-
-Expected<StringRef> writeOffloadFile(const OffloadFile &File) {
-  const OffloadBinary &Binary = *File.getBinary();
-
-  StringRef Prefix =
-      sys::path::stem(Binary.getMemoryBufferRef().getBufferIdentifier());
-  SmallString<128> Filename;
-  (Prefix + "-" + Binary.getTriple() + "-" + Binary.getArch())
-      .toVector(Filename);
-  llvm::replace(Filename, ':', '-');
-  auto TempFileOrErr = createOutputFile(Filename, "o");
-  if (!TempFileOrErr)
-    return TempFileOrErr.takeError();
-
-  Expected<std::unique_ptr<FileOutputBuffer>> OutputOrErr =
-      FileOutputBuffer::create(*TempFileOrErr, Binary.getImage().size());
-  if (!OutputOrErr)
-    return OutputOrErr.takeError();
-  std::unique_ptr<FileOutputBuffer> Output = std::move(*OutputOrErr);
-  llvm::copy(Binary.getImage(), Output->getBufferStart());
-  if (Error E = Output->commit())
-    return std::move(E);
-
-  return *TempFileOrErr;
 }
 
 // Compile the module to an object file using the appropriate target machine for
