@@ -96,7 +96,7 @@ getOffloadingEntryInitializer(Module &M, object::OffloadKind Kind,
 /// Creates a pair of globals used to iterate the array of offloading entries by
 /// accessing the section variables provided by the linker.
 std::pair<GlobalVariable *, GlobalVariable *>
-getOffloadEntryArray(Module &M, StringRef SectionName);
+getOffloadEntryArray(Module &M, StringRef SectionName = "llvm_offload_entries");
 
 namespace amdgpu {
 /// Check if an image is compatible with current system's environment. The

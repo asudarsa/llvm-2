@@ -14,7 +14,6 @@
 //
 //===---------------------------------------------------------------------===//
 
-#include "clang/Basic/Cuda.h"
 #include "clang/Basic/TargetID.h"
 #include "clang/Basic/Version.h"
 #include "llvm/ADT/MapVector.h"
@@ -22,7 +21,6 @@
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/CodeGen/CommandFlags.h"
 #include "llvm/Frontend/Offloading/OffloadWrapper.h"
-#include "llvm/Frontend/Offloading/SYCLOffloadWrapper.h"
 #include "llvm/Frontend/Offloading/Utility.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DiagnosticPrinter.h"
@@ -42,13 +40,11 @@
 #include "llvm/Option/Option.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Remarks/HotnessThresholdParser.h"
-#include "llvm/SYCLPostLink/ModuleSplitter.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Errc.h"
 #include "llvm/Support/FileOutputBuffer.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
-#include "llvm/Support/LineIterator.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Parallel.h"
 #include "llvm/Support/Path.h"
@@ -64,9 +60,6 @@
 #include "llvm/TargetParser/Host.h"
 #include <atomic>
 #include <optional>
-
-#define COMPILE_OPTS "compile-opts"
-#define LINK_OPTS "link-opts"
 
 using namespace llvm;
 using namespace llvm::opt;
@@ -147,12 +140,6 @@ static std::list<SmallString<128>> TempFiles;
 /// Codegen flags for LTO backend.
 static codegen::RegisterCodeGenFlags CodeGenFlags;
 
-static std::optional<llvm::module_split::IRSplitMode> SYCLModuleSplitMode;
-
-static bool UseSYCLPostLinkTool;
-
-static SmallString<128> OffloadImageDumpDir;
-
 using OffloadingImage = OffloadBinary::OffloadingImage;
 
 namespace llvm {
@@ -231,33 +218,6 @@ void printCommands(ArrayRef<StringRef> CmdArgs) {
   exit(EXIT_FAILURE);
 }
 
-/// Create an extra user-specified \p OffloadFile.
-/// TODO: We should find a way to wrap these as libraries instead.
-Expected<OffloadFile> getInputBitcodeLibrary(StringRef Input) {
-  auto [Device, Path] = StringRef(Input).split('=');
-  auto [String, Arch] = Device.rsplit('-');
-  auto [Kind, Triple] = String.split('-');
-
-  llvm::ErrorOr<std::unique_ptr<MemoryBuffer>> ImageOrError =
-      llvm::MemoryBuffer::getFileOrSTDIN(Path);
-  if (std::error_code EC = ImageOrError.getError())
-    return createFileError(Path, EC);
-
-  OffloadingImage Image{};
-  Image.TheImageKind = IMG_Bitcode;
-  Image.TheOffloadKind = getOffloadKind(Kind);
-  Image.StringData["triple"] = Triple;
-  Image.StringData["arch"] = Arch;
-  Image.Image = std::move(*ImageOrError);
-
-  std::unique_ptr<MemoryBuffer> Binary = MemoryBuffer::getMemBufferCopy(
-      OffloadBinary::write(Image), Image.Image->getBufferIdentifier());
-  auto NewBinaryOrErr = OffloadBinary::create(*Binary);
-  if (!NewBinaryOrErr)
-    return NewBinaryOrErr.takeError();
-  return OffloadFile(std::move(*NewBinaryOrErr), std::move(Binary));
-}
-
 std::string getMainExecutable(const char *Name) {
   void *Ptr = (void *)(intptr_t)&getMainExecutable;
   auto COWPath = sys::fs::getMainExecutable(Name, Ptr);
@@ -269,9 +229,7 @@ Expected<StringRef> createOutputFile(const Twine &Prefix, StringRef Extension) {
   std::scoped_lock<decltype(TempFilesMutex)> Lock(TempFilesMutex);
   SmallString<128> OutputFile;
   if (SaveTemps) {
-    // Generate a unique path name without creating a file
-    sys::fs::createUniquePath(Prefix + "-%%%%%%." + Extension, OutputFile,
-                              /*MakeAbsolute=*/false);
+    (Prefix + "." + Extension).toNullTerminatedStringRef(OutputFile);
   } else {
     if (std::error_code EC =
             sys::fs::createTemporaryFile(Prefix, Extension, OutputFile))
@@ -282,18 +240,16 @@ Expected<StringRef> createOutputFile(const Twine &Prefix, StringRef Extension) {
   return TempFiles.back();
 }
 
-// TODO: Remove HasSYCLOffloadKind dependence when aligning with community code.
-Expected<StringRef> writeOffloadFile(const OffloadFile &File,
-                                     bool HasSYCLOffloadKind = false) {
+Expected<StringRef> writeOffloadFile(const OffloadFile &File) {
   const OffloadBinary &Binary = *File.getBinary();
 
   StringRef Prefix =
       sys::path::stem(Binary.getMemoryBufferRef().getBufferIdentifier());
-  StringRef Suffix = getImageKindName(Binary.getImageKind());
-
-  auto TempFileOrErr = createOutputFile(
-      Prefix + "-" + Binary.getTriple() + "-" + Binary.getArch(),
-      HasSYCLOffloadKind ? getImageKindName(Binary.getImageKind()) : "o");
+  SmallString<128> Filename;
+  (Prefix + "-" + Binary.getTriple() + "-" + Binary.getArch())
+      .toVector(Filename);
+  llvm::replace(Filename, ':', '-');
+  auto TempFileOrErr = createOutputFile(Filename, "o");
   if (!TempFileOrErr)
     return TempFileOrErr.takeError();
 
@@ -473,46 +429,6 @@ fatbinary(ArrayRef<std::pair<StringRef, StringRef>> InputFiles,
 
   return *TempFileOrErr;
 }
-
-// ptxas binary
-Expected<StringRef> ptxas(StringRef InputFile, const ArgList &Args,
-                          StringRef Arch) {
-  llvm::TimeTraceScope TimeScope("NVPTX ptxas");
-  // NVPTX uses the ptxas program to process assembly files.
-  Expected<std::string> PtxasPath =
-      findProgram("ptxas", {CudaBinaryPath + "/bin"});
-  if (!PtxasPath)
-    return PtxasPath.takeError();
-
-  llvm::Triple Triple(
-      Args.getLastArgValue(OPT_host_triple_EQ, sys::getDefaultTargetTriple()));
-
-  // Create a new file to write the output to.
-  auto TempFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "cubin");
-  if (!TempFileOrErr)
-    return TempFileOrErr.takeError();
-
-  SmallVector<StringRef, 16> CmdArgs;
-  CmdArgs.push_back(*PtxasPath);
-  CmdArgs.push_back(Triple.isArch64Bit() ? "-m64" : "-m32");
-  // Pass -v to ptxas if it was passed to the driver.
-  if (Args.hasArg(OPT_verbose))
-    CmdArgs.push_back("-v");
-  StringRef OptLevel = Args.getLastArgValue(OPT_opt_level, "O2");
-  if (Args.hasArg(OPT_debug))
-    CmdArgs.push_back("-g");
-  else
-    CmdArgs.push_back(Args.MakeArgString("-" + OptLevel));
-  CmdArgs.push_back("--gpu-name");
-  CmdArgs.push_back(Arch);
-  CmdArgs.push_back("--output-file");
-  CmdArgs.push_back(*TempFileOrErr);
-  CmdArgs.push_back(InputFile);
-  if (Error Err = executeCommands(*PtxasPath, CmdArgs))
-    return std::move(Err);
-  return *TempFileOrErr;
-}
 } // namespace nvptx
 
 namespace amdgcn {
@@ -572,931 +488,9 @@ fatbinary(ArrayRef<std::pair<StringRef, StringRef>> InputFiles,
 }
 } // namespace amdgcn
 
-namespace sycl {
-// This utility function is used to gather all SYCL device library files that
-// will be linked with input device files.
-// The list of files and its location are passed from driver.
-static Error getSYCLDeviceLibs(SmallVector<std::string, 16> &DeviceLibFiles,
-                               const ArgList &Args) {
-  StringRef SYCLDeviceLibLoc("");
-  if (Arg *A = Args.getLastArg(OPT_sycl_device_library_location_EQ))
-    SYCLDeviceLibLoc = A->getValue();
-  if (Arg *A = Args.getLastArg(OPT_sycl_device_lib_EQ)) {
-    if (A->getValues().size() == 0)
-      return createStringError(
-          inconvertibleErrorCode(),
-          "Number of device library files cannot be zero.");
-    for (StringRef Val : A->getValues()) {
-      SmallString<128> LibName(SYCLDeviceLibLoc);
-      llvm::sys::path::append(LibName, Val);
-      if (llvm::sys::fs::exists(LibName))
-        DeviceLibFiles.push_back(std::string(LibName));
-      else
-        return createStringError(inconvertibleErrorCode(),
-                                 std::string(LibName) +
-                                     " SYCL device library file is not found.");
-    }
-  }
-  return Error::success();
-}
-
-/// This routine is used to convert SPIR-V input files into LLVM IR files.
-/// 'llvm-spirv -r' command is used for this purpose.
-/// If input is not a SPIR-V file, then the original file is returned.
-/// TODO: Add a check to identify SPIR-V files and exit early if the input is
-/// not a SPIR-V file.
-/// 'Filename' is the input file that could be a SPIR-V file.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// llvm-spirv tool.
-static Expected<StringRef> convertSPIRVToIR(StringRef Filename,
-                                            const ArgList &Args) {
-  Expected<std::string> SPIRVToIRWrapperPath = findProgram(
-      "spirv-to-ir-wrapper", {getMainExecutable("spirv-to-ir-wrapper")});
-  if (!SPIRVToIRWrapperPath)
-    return SPIRVToIRWrapperPath.takeError();
-
-  // Create a new file to write the converted file to.
-  auto TempFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "bc");
-  if (!TempFileOrErr)
-    return TempFileOrErr.takeError();
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*SPIRVToIRWrapperPath);
-  CmdArgs.push_back(Filename);
-  CmdArgs.push_back("-o");
-  CmdArgs.push_back(*TempFileOrErr);
-  CmdArgs.push_back("--llvm-spirv-opts");
-  CmdArgs.push_back("--spirv-preserve-auxdata --spirv-target-env=SPV-IR "
-                    "--spirv-builtin-format=global");
-  if (Error Err = executeCommands(*SPIRVToIRWrapperPath, CmdArgs))
-    return std::move(Err);
-  return *TempFileOrErr;
-}
-
-/// Add any sycl-post-link options that rely on a specific Triple in addition
-/// to user supplied options.
-/// NOTE: Any changes made here should be reflected in the similarly named
-/// function in clang/lib/Driver/ToolChains/Clang.cpp.
-static void
-getTripleBasedSYCLPostLinkOpts(const ArgList &Args,
-                               SmallVector<StringRef, 8> &PostLinkArgs,
-                               const llvm::Triple Triple) {
-  const llvm::Triple HostTriple(Args.getLastArgValue(OPT_host_triple_EQ));
-  bool SYCLNativeCPU = (HostTriple == Triple);
-  bool SpecConstsSupported = (!Triple.isNVPTX() && !Triple.isAMDGCN() &&
-                              !Triple.isSPIRAOT() && !SYCLNativeCPU);
-  if (SpecConstsSupported)
-    PostLinkArgs.push_back("-spec-const=native");
-  else
-    PostLinkArgs.push_back("-spec-const=emulation");
-
-  // TODO: If we ever pass -ir-output-only based on the triple,
-  // make sure we don't pass -properties.
-  PostLinkArgs.push_back("-properties");
-
-  // See if device code splitting is already requested. If not requested, then
-  // set -split=auto for non-FPGA targets.
-  bool NoSplit = true;
-  for (auto Arg : PostLinkArgs)
-    if (Arg.contains("-split=")) {
-      NoSplit = false;
-      break;
-    }
-  if (NoSplit && (Triple.getSubArch() != llvm::Triple::SPIRSubArch_fpga))
-    PostLinkArgs.push_back("-split=auto");
-
-  // On Intel targets we don't need non-kernel functions as entry points,
-  // because it only increases amount of code for device compiler to handle,
-  // without any actual benefits.
-  // TODO: Try to extend this feature for non-Intel GPUs.
-  if ((!Args.hasFlag(OPT_no_sycl_remove_unused_external_funcs,
-                     OPT_sycl_remove_unused_external_funcs, false) &&
-       !SYCLNativeCPU) &&
-      !Args.hasArg(OPT_sycl_allow_device_image_dependencies) &&
-      !Triple.isNVPTX() && !Triple.isAMDGPU())
-    PostLinkArgs.push_back("-emit-only-kernels-as-entry-points");
-
-  if (!Triple.isAMDGCN())
-    PostLinkArgs.push_back("-emit-param-info");
-  // Enable program metadata
-  if (Triple.isNVPTX() || Triple.isAMDGCN() || SYCLNativeCPU)
-    PostLinkArgs.push_back("-emit-program-metadata");
-
-  bool SplitEsimdByDefault = Triple.isSPIROrSPIRV();
-  bool SplitEsimd =
-      Args.hasFlag(OPT_sycl_device_code_split_esimd,
-                   OPT_no_sycl_device_code_split_esimd, SplitEsimdByDefault);
-  if (!Args.hasArg(OPT_sycl_thin_lto))
-    PostLinkArgs.push_back("-symbols");
-  // Specialization constant info generation is mandatory -
-  // add options unconditionally
-  PostLinkArgs.push_back("-emit-exported-symbols");
-  PostLinkArgs.push_back("-emit-imported-symbols");
-  if (SplitEsimd)
-    PostLinkArgs.push_back("-split-esimd");
-  PostLinkArgs.push_back("-lower-esimd");
-
-  bool IsAOT = Triple.isNVPTX() || Triple.isAMDGCN() || Triple.isSPIRAOT();
-  if (Args.hasFlag(OPT_sycl_add_default_spec_consts_image,
-                   OPT_no_sycl_add_default_spec_consts_image, false) &&
-      IsAOT)
-    PostLinkArgs.push_back("-generate-device-image-default-spec-consts");
-}
-
-/// Run sycl-post-link tool for SYCL offloading.
-/// 'InputFiles' is the list of input LLVM IR files.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// sycl-post-link tool.
-static Expected<std::vector<module_split::SplitModule>>
-runSYCLPostLinkTool(ArrayRef<StringRef> InputFiles, const ArgList &Args) {
-  Expected<std::string> SYCLPostLinkPath =
-      findProgram("sycl-post-link", {getMainExecutable("sycl-post-link")});
-  if (!SYCLPostLinkPath)
-    return SYCLPostLinkPath.takeError();
-
-  // Create a new file to write the output of sycl-post-link to.
-  auto TempFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "table");
-  if (!TempFileOrErr)
-    return TempFileOrErr.takeError();
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*SYCLPostLinkPath);
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
-  Arg *SYCLDeviceLibLoc = Args.getLastArg(OPT_sycl_device_library_location_EQ);
-  if (SYCLDeviceLibLoc && !Triple.isSPIRAOT()) {
-    std::string SYCLDeviceLibLocParam = SYCLDeviceLibLoc->getValue();
-    std::string BF16DeviceLibLoc =
-        SYCLDeviceLibLocParam + "/libsycl-native-bfloat16.bc";
-    if (llvm::sys::fs::exists(BF16DeviceLibLoc)) {
-      SYCLDeviceLibLocParam = "--device-lib-dir=" + SYCLDeviceLibLocParam;
-      CmdArgs.push_back(Args.MakeArgString(StringRef(SYCLDeviceLibLocParam)));
-    }
-  }
-  getTripleBasedSYCLPostLinkOpts(Args, CmdArgs, Triple);
-  StringRef SYCLPostLinkOptions;
-  if (Arg *A = Args.getLastArg(OPT_sycl_post_link_options_EQ))
-    SYCLPostLinkOptions = A->getValue();
-  SYCLPostLinkOptions.split(CmdArgs, " ", /* MaxSplit = */ -1,
-                            /* KeepEmpty = */ false);
-  CmdArgs.push_back("-o");
-  CmdArgs.push_back(*TempFileOrErr);
-  for (auto &File : InputFiles)
-    CmdArgs.push_back(File);
-  if (Error Err = executeCommands(*SYCLPostLinkPath, CmdArgs))
-    return std::move(Err);
-
-  if (DryRun) {
-    // In DryRun we need a dummy entry in order to continue the whole pipeline.
-    auto ImageFileOrErr = createOutputFile(
-        sys::path::filename(ExecutableName) + ".sycl.split.image", "bc");
-    if (!ImageFileOrErr)
-      return ImageFileOrErr.takeError();
-
-    std::vector Modules = {module_split::SplitModule(
-        *ImageFileOrErr, util::PropertySetRegistry(), "")};
-    return Modules;
-  }
-
-  return llvm::module_split::parseSplitModulesFromFile(*TempFileOrErr);
-}
-
-/// Invokes SYCL Split library for SYCL offloading.
-///
-/// \param InputFiles the list of input LLVM IR files.
-/// \param Args Encompasses all arguments for linking and wrapping device code.
-///  It will be parsed to generate options required to be passed to SYCL split
-///  library.
-/// \param Mode The splitting mode.
-/// \returns The vector of split modules.
-static Expected<std::vector<module_split::SplitModule>>
-runSYCLSplitLibrary(ArrayRef<StringRef> InputFiles, const ArgList &Args,
-                    module_split::IRSplitMode Mode) {
-  std::vector<module_split::SplitModule> SplitModules;
-  if (DryRun) {
-    auto OutputFileOrErr = createOutputFile(
-        sys::path::filename(ExecutableName) + ".sycl.split.image", "bc");
-    if (!OutputFileOrErr)
-      return OutputFileOrErr.takeError();
-
-    StringRef OutputFilePath = *OutputFileOrErr;
-    auto InputFilesStr = llvm::join(InputFiles.begin(), InputFiles.end(), ",");
-    errs() << formatv("sycl-module-split: input: {0}, output: {1}\n",
-                      InputFilesStr, OutputFilePath);
-    SplitModules.emplace_back(OutputFilePath, util::PropertySetRegistry(), "");
-    return SplitModules;
-  }
-
-  llvm::module_split::ModuleSplitterSettings Settings;
-  Settings.Mode = Mode;
-  Settings.OutputPrefix = "";
-
-  for (StringRef InputFile : InputFiles) {
-    SMDiagnostic Err;
-    LLVMContext C;
-    std::unique_ptr<Module> M = parseIRFile(InputFile, Err, C);
-    if (!M)
-      return createStringError(inconvertibleErrorCode(), Err.getMessage());
-
-    auto SplitModulesOrErr =
-        module_split::splitSYCLModule(std::move(M), Settings);
-    if (!SplitModulesOrErr)
-      return SplitModulesOrErr.takeError();
-
-    auto &NewSplitModules = *SplitModulesOrErr;
-    SplitModules.insert(SplitModules.end(), NewSplitModules.begin(),
-                        NewSplitModules.end());
-  }
-
-  if (Verbose) {
-    auto InputFilesStr = llvm::join(InputFiles.begin(), InputFiles.end(), ",");
-    std::string SplitOutputFilesStr;
-    for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
-      if (I > 0)
-        SplitOutputFilesStr += ',';
-
-      SplitOutputFilesStr += SplitModules[I].ModuleFilePath;
-    }
-
-    errs() << formatv("sycl-module-split: input: {0}, output: {1}\n",
-                      InputFilesStr, SplitOutputFilesStr);
-  }
-
-  return SplitModules;
-}
-
-/// Add any llvm-spirv option that relies on a specific Triple in addition
-/// to user supplied options.
-/// NOTE: Any changes made here should be reflected in the similarly named
-/// function in clang/lib/Driver/ToolChains/Clang.cpp.
-static void
-getTripleBasedSPIRVTransOpts(const ArgList &Args,
-                             SmallVector<StringRef, 8> &TranslatorArgs,
-                             const llvm::Triple Triple) {
-  bool IsCPU = Triple.isSPIR() &&
-               Triple.getSubArch() == llvm::Triple::SPIRSubArch_x86_64;
-  TranslatorArgs.push_back("-spirv-debug-info-version=nonsemantic-shader-200");
-  std::string UnknownIntrinsics("-spirv-allow-unknown-intrinsics=llvm.genx.");
-  if (IsCPU)
-    UnknownIntrinsics += ",llvm.fpbuiltin";
-  TranslatorArgs.push_back(Args.MakeArgString(UnknownIntrinsics));
-
-  // Disable all the extensions by default
-  std::string ExtArg("-spirv-ext=-all");
-  std::string DefaultExtArg =
-      ",+SPV_EXT_shader_atomic_float_add,+SPV_EXT_shader_atomic_float_min_max"
-      ",+SPV_KHR_no_integer_wrap_decoration,+SPV_KHR_float_controls"
-      ",+SPV_KHR_expect_assume,+SPV_KHR_linkonce_odr";
-  std::string INTELExtArg =
-      ",+SPV_INTEL_subgroups,+SPV_INTEL_media_block_io"
-      ",+SPV_INTEL_device_side_avc_motion_estimation"
-      ",+SPV_INTEL_fpga_loop_controls,+SPV_INTEL_unstructured_loop_controls"
-      ",+SPV_INTEL_fpga_reg,+SPV_INTEL_blocking_pipes"
-      ",+SPV_INTEL_function_pointers,+SPV_INTEL_kernel_attributes"
-      ",+SPV_INTEL_io_pipes,+SPV_INTEL_inline_assembly"
-      ",+SPV_INTEL_arbitrary_precision_integers"
-      ",+SPV_INTEL_float_controls2,+SPV_INTEL_vector_compute"
-      ",+SPV_INTEL_fast_composite"
-      ",+SPV_INTEL_arbitrary_precision_fixed_point"
-      ",+SPV_INTEL_arbitrary_precision_floating_point"
-      ",+SPV_INTEL_variable_length_array,+SPV_INTEL_fp_fast_math_mode"
-      ",+SPV_INTEL_long_composites"
-      ",+SPV_INTEL_arithmetic_fence"
-      ",+SPV_INTEL_global_variable_decorations"
-      ",+SPV_INTEL_cache_controls"
-      ",+SPV_INTEL_fpga_buffer_location"
-      ",+SPV_INTEL_fpga_argument_interfaces"
-      ",+SPV_INTEL_fpga_invocation_pipelining_attributes"
-      ",+SPV_INTEL_fpga_latency_control"
-      ",+SPV_KHR_shader_clock"
-      ",+SPV_INTEL_bindless_images"
-      ",+SPV_INTEL_task_sequence";
-  ExtArg = ExtArg + DefaultExtArg + INTELExtArg;
-  ExtArg += ",+SPV_INTEL_bfloat16_conversion"
-            ",+SPV_INTEL_joint_matrix"
-            ",+SPV_INTEL_hw_thread_queries"
-            ",+SPV_KHR_uniform_group_instructions"
-            ",+SPV_INTEL_masked_gather_scatter"
-            ",+SPV_INTEL_tensor_float32_conversion"
-            ",+SPV_INTEL_optnone"
-            ",+SPV_KHR_non_semantic_info"
-            ",+SPV_KHR_cooperative_matrix"
-            ",+SPV_EXT_shader_atomic_float16_add"
-            ",+SPV_INTEL_fp_max_error";
-  TranslatorArgs.push_back(Args.MakeArgString(ExtArg));
-}
-
-/// Run LLVM to SPIR-V translation.
-/// Converts 'File' from LLVM bitcode to SPIR-V format using llvm-spirv tool.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// llvm-spirv tool.
-static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
-                                                     const ArgList &Args) {
-  Expected<std::string> LLVMToSPIRVPath =
-      findProgram("llvm-spirv", {getMainExecutable("llvm-spirv")});
-  if (!LLVMToSPIRVPath)
-    return LLVMToSPIRVPath.takeError();
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*LLVMToSPIRVPath);
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
-  getTripleBasedSPIRVTransOpts(Args, CmdArgs, Triple);
-  StringRef LLVMToSPIRVOptions;
-  if (Arg *A = Args.getLastArg(OPT_llvm_spirv_options_EQ))
-    LLVMToSPIRVOptions = A->getValue();
-  LLVMToSPIRVOptions.split(CmdArgs, " ", /* MaxSplit = */ -1,
-                           /* KeepEmpty = */ false);
-  CmdArgs.push_back("-o");
-
-  // Create a new file to write the translated file to.
-  auto TempFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "spv");
-  if (!TempFileOrErr)
-    return TempFileOrErr.takeError();
-
-  CmdArgs.push_back(*TempFileOrErr);
-  CmdArgs.push_back(File);
-  if (Error Err = executeCommands(*LLVMToSPIRVPath, CmdArgs))
-    return std::move(Err);
-
-  return *TempFileOrErr;
-}
-
-/// Adds all AOT backend options required for SYCL AOT compilation step to
-/// 'CmdArgs'.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate backend options required to be passed
-/// into the SYCL AOT compilation step.
-/// IsCPU is a bool used to direct option generation. If IsCPU is false, then
-/// options are generated for AOT compilation targeting Intel GPUs.
-static void addBackendOptions(const ArgList &Args,
-                              SmallVector<StringRef, 8> &CmdArgs, bool IsCPU) {
-  StringRef OptC =
-      Args.getLastArgValue(OPT_sycl_backend_compile_options_from_image_EQ);
-  OptC.split(CmdArgs, " ", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
-  StringRef OptL =
-      Args.getLastArgValue(OPT_sycl_backend_link_options_from_image_EQ);
-  OptL.split(CmdArgs, " ", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
-  StringRef OptTool = (IsCPU) ? Args.getLastArgValue(OPT_cpu_tool_arg_EQ)
-                              : Args.getLastArgValue(OPT_gpu_tool_arg_EQ);
-  OptTool.split(CmdArgs, " ", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
-  return;
-}
-
-/// Run AOT compilation for Intel CPU.
-/// Calls opencl-aot tool to generate device code for Intel CPU backend.
-/// 'InputFile' is the input SPIR-V file.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// SYCL AOT compilation step.
-static Expected<StringRef> runAOTCompileIntelCPU(StringRef InputFile,
-                                                 const ArgList &Args) {
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
-  SmallVector<StringRef, 8> CmdArgs;
-  Expected<std::string> OpenCLAOTPath =
-      findProgram("opencl-aot", {getMainExecutable("opencl-aot")});
-  if (!OpenCLAOTPath)
-    return OpenCLAOTPath.takeError();
-
-  CmdArgs.push_back(*OpenCLAOTPath);
-  CmdArgs.push_back("--device=cpu");
-  addBackendOptions(Args, CmdArgs, /* IsCPU */ true);
-  // Create a new file to write the translated file to.
-  auto TempFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "out");
-  if (!TempFileOrErr)
-    return TempFileOrErr.takeError();
-  CmdArgs.push_back("-o");
-  CmdArgs.push_back(*TempFileOrErr);
-  CmdArgs.push_back(InputFile);
-  if (Error Err = executeCommands(*OpenCLAOTPath, CmdArgs))
-    return std::move(Err);
-  return *TempFileOrErr;
-}
-
-/// Run AOT compilation for Intel GPU
-/// Calls ocloc tool to generate device code for Intel GPU backend.
-/// 'InputFile' is the input SPIR-V file.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// SYCL AOT compilation step.
-static Expected<StringRef> runAOTCompileIntelGPU(StringRef InputFile,
-                                                 const ArgList &Args) {
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
-  StringRef Arch(Args.getLastArgValue(OPT_arch_EQ));
-  SmallVector<StringRef, 8> CmdArgs;
-  Expected<std::string> OclocPath =
-      findProgram("ocloc", {getMainExecutable("ocloc")});
-  if (!OclocPath)
-    return OclocPath.takeError();
-
-  CmdArgs.push_back(*OclocPath);
-  // The next line prevents ocloc from modifying the image name
-  CmdArgs.push_back("-output_no_suffix");
-  CmdArgs.push_back("-spirv_input");
-  if (!Arch.empty()) {
-    CmdArgs.push_back("-device");
-    CmdArgs.push_back(Arch);
-  }
-  addBackendOptions(Args, CmdArgs, /* IsCPU */ false);
-  // Create a new file to write the translated file to.
-  auto TempFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "out");
-  if (!TempFileOrErr)
-    return TempFileOrErr.takeError();
-  CmdArgs.push_back("-output");
-  CmdArgs.push_back(*TempFileOrErr);
-  CmdArgs.push_back("-file");
-  CmdArgs.push_back(InputFile);
-  if (Error Err = executeCommands(*OclocPath, CmdArgs))
-    return std::move(Err);
-  return *TempFileOrErr;
-}
-
-/// Run AOT compilation for Intel CPU/GPU.
-/// 'InputFile' is the input SPIR-V file.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// SYCL AOT compilation step.
-static Expected<StringRef> runAOTCompile(StringRef InputFile,
-                                         const ArgList &Args) {
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
-  if (Triple.isSPIRAOT()) {
-    if (Triple.getSubArch() == llvm::Triple::SPIRSubArch_gen)
-      return runAOTCompileIntelGPU(InputFile, Args);
-    if (Triple.getSubArch() == llvm::Triple::SPIRSubArch_x86_64)
-      return runAOTCompileIntelCPU(InputFile, Args);
-  }
-  return createStringError(inconvertibleErrorCode(),
-                           "Unsupported SYCL Triple and Arch");
-}
-
-/// Reads device images from the given \p InputFile and wraps them
-/// in one LLVM IR Module as a constant data.
-///
-/// \returns A path to the LLVM Module that contains wrapped images.
-Expected<StringRef>
-wrapSYCLBinariesFromFile(std::vector<module_split::SplitModule> &SplitModules,
-                         const ArgList &Args, bool IsEmbeddedIR) {
-  auto OutputFileOrErr = createOutputFile(
-      sys::path::filename(ExecutableName) + ".sycl.image.wrapper", "bc");
-  if (!OutputFileOrErr)
-    return OutputFileOrErr.takeError();
-
-  StringRef OutputFilePath = *OutputFileOrErr;
-  if (Verbose || DryRun) {
-    std::string InputFiles;
-    for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
-      InputFiles += SplitModules[I].ModuleFilePath;
-      if (I + 1 < E)
-        InputFiles += ',';
-    }
-
-    errs() << formatv(" offload-wrapper: input: {0}, output: {1}\n", InputFiles,
-                      OutputFilePath);
-    if (DryRun)
-      return OutputFilePath;
-  }
-
-  StringRef Target = Args.getLastArgValue(OPT_triple_EQ);
-  if (Target.empty())
-    return createStringError(
-        inconvertibleErrorCode(),
-        "can't wrap SYCL image. -triple argument is missed.");
-
-  SmallVector<llvm::offloading::SYCLImage> Images;
-  // SYCL runtime currently works for spir64 target triple and not for
-  // spir64-unknown-unknown/spirv64-unknown-unknown/spirv64.
-  // TODO: Fix SYCL runtime to accept other triples
-  llvm::Triple T(Target);
-  std::string EmbeddedIRTarget("llvm_");
-  EmbeddedIRTarget.append(T.getArchName());
-  StringRef RegularTarget(T.getArchName());
-  if (RegularTarget == "spirv64")
-    RegularTarget = "spir64";
-
-  for (auto &SI : SplitModules) {
-    if (!OffloadImageDumpDir.empty()) {
-      StringRef CopyFrom = SI.ModuleFilePath;
-      SmallString<128> CopyTo = OffloadImageDumpDir;
-      StringRef Filename = sys::path::filename(CopyFrom);
-      CopyTo.append(Filename);
-      std::error_code EC = sys::fs::copy_file(CopyFrom, CopyTo);
-      if (EC)
-        return createStringError(EC, formatv("failed to copy file. From: "
-                                             "{0} to: {1}, error_code: {2}",
-                                             CopyFrom, CopyTo, EC.value()));
-    }
-
-    auto MBOrDesc = MemoryBuffer::getFile(SI.ModuleFilePath);
-    if (!MBOrDesc)
-      return createFileError(SI.ModuleFilePath, MBOrDesc.getError());
-
-    StringRef ImageTarget =
-        IsEmbeddedIR ? StringRef(EmbeddedIRTarget) : StringRef(RegularTarget);
-    Images.emplace_back(std::move(*MBOrDesc), SI.Properties, SI.Symbols,
-                        ImageTarget);
-  }
-
-  LLVMContext C;
-  Module M("offload.wrapper.object", C);
-  M.setTargetTriple(
-      Args.getLastArgValue(OPT_host_triple_EQ, sys::getDefaultTargetTriple()));
-
-  auto CompileOptionsFromSYCLBackendCompileOptions =
-      Args.getLastArgValue(OPT_sycl_backend_compile_options_EQ);
-  auto LinkOptionsFromSYCLTargetLinkOptions =
-      Args.getLastArgValue(OPT_sycl_target_link_options_EQ);
-
-  StringRef CompileOptions(
-      Args.MakeArgString(CompileOptionsFromSYCLBackendCompileOptions.str()));
-  StringRef LinkOptions(
-      Args.MakeArgString(LinkOptionsFromSYCLTargetLinkOptions.str()));
-  offloading::SYCLWrappingOptions WrappingOptions;
-  WrappingOptions.CompileOptions = CompileOptions;
-  WrappingOptions.LinkOptions = LinkOptions;
-  if (Verbose) {
-    errs() << formatv(" offload-wrapper: compile-opts: {0}, link-opts: {1}\n",
-                      CompileOptions, LinkOptions);
-  }
-  if (Error E = offloading::wrapSYCLBinaries(M, Images, WrappingOptions))
-    return E;
-
-  if (Args.hasArg(OPT_print_wrapped_module))
-    errs() << "Wrapped Module\n" << M;
-
-  // TODO: Once "clang tool->runCompile" migration is finished we need to remove
-  // this scope and use community flow.
-  int FD = -1;
-  if (std::error_code EC = sys::fs::openFileForWrite(OutputFilePath, FD))
-    return errorCodeToError(EC);
-
-  raw_fd_ostream OS(FD, true);
-  WriteBitcodeToFile(M, OS);
-  return OutputFilePath;
-}
-
-/// Run clang tool for SYCL offloading.
-/// 'InputFile' is the wrapped input file.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// clang tool.
-static Expected<StringRef> runCompile(StringRef &InputFile,
-                                      const ArgList &Args) {
-  // Create a new file to write the output of clang to.
-  auto OutputFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "o");
-  if (!OutputFileOrErr)
-    return OutputFileOrErr.takeError();
-
-  Expected<std::string> ClangPath =
-      findProgram("clang", {getMainExecutable("clang")});
-  if (!ClangPath)
-    return ClangPath.takeError();
-
-  const llvm::Triple HostTriple(Args.getLastArgValue(OPT_host_triple_EQ));
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*ClangPath);
-
-  const std::string TargetStr = "--target=" + HostTriple.getTriple();
-  CmdArgs.push_back(TargetStr);
-
-  // Checking for '-shared' linker option
-  if (Args.hasArg(OPT_shared)) {
-    if (!HostTriple.isOSWindows())
-      CmdArgs.push_back("-fPIC");
-  }
-  CmdArgs.push_back("-c");
-  CmdArgs.push_back("-o");
-  CmdArgs.push_back(*OutputFileOrErr);
-  CmdArgs.push_back(InputFile);
-  if (Error Err = executeCommands(*ClangPath, CmdArgs))
-    return std::move(Err);
-  return *OutputFileOrErr;
-}
-
-// Run wrapping library and clang
-static Expected<StringRef>
-runWrapperAndCompile(std::vector<module_split::SplitModule> &SplitModules,
-                     const ArgList &Args, bool IsEmbeddedIR = false) {
-  auto OutputFile =
-      sycl::wrapSYCLBinariesFromFile(SplitModules, Args, IsEmbeddedIR);
-  if (!OutputFile)
-    return OutputFile.takeError();
-  // call to clang
-  auto OutputFileOrErr = sycl::runCompile(*OutputFile, Args);
-  if (!OutputFileOrErr)
-    return OutputFileOrErr.takeError();
-  return *OutputFileOrErr;
-}
-
-/// Link all SYCL device input files into one before adding device library
-/// files. Device linking is performed using llvm-link tool.
-/// 'InputFiles' is the list of all LLVM IR device input files.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// llvm-link tool.
-Expected<StringRef> linkDeviceInputFiles(SmallVectorImpl<StringRef> &InputFiles,
-                                         const ArgList &Args) {
-  llvm::TimeTraceScope TimeScope("SYCL LinkDeviceInputFiles");
-
-  Expected<std::string> LLVMLinkPath =
-      findProgram("llvm-link", {getMainExecutable("llvm-link")});
-  if (!LLVMLinkPath)
-    return LLVMLinkPath.takeError();
-
-  // Create a new file to write the linked device file to.
-  auto OutFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "bc");
-  if (!OutFileOrErr)
-    return OutFileOrErr.takeError();
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*LLVMLinkPath);
-  for (auto &File : InputFiles) {
-    auto IRFile = sycl::convertSPIRVToIR(File, Args);
-    if (!IRFile)
-      return IRFile.takeError();
-    CmdArgs.push_back(*IRFile);
-  }
-  CmdArgs.push_back("-o");
-  CmdArgs.push_back(*OutFileOrErr);
-  CmdArgs.push_back("--suppress-warnings");
-  if (Error Err = executeCommands(*LLVMLinkPath, CmdArgs))
-    return std::move(Err);
-  return *OutFileOrErr;
-}
-
-/// Link all device library files and input file into one LLVM IR file. This
-/// linking is performed using llvm-link tool.
-/// 'InputFiles' is the list of all LLVM IR device input files.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// llvm-link tool.
-static Expected<StringRef>
-linkDeviceLibFiles(SmallVectorImpl<StringRef> &InputFiles,
-                   const ArgList &Args) {
-  llvm::TimeTraceScope TimeScope("LinkDeviceLibraryFiles");
-
-  Expected<std::string> LLVMLinkPath =
-      findProgram("llvm-link", {getMainExecutable("llvm-link")});
-  if (!LLVMLinkPath)
-    return LLVMLinkPath.takeError();
-
-  // Create a new file to write the linked device file to.
-  auto OutFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "bc");
-  if (!OutFileOrErr)
-    return OutFileOrErr.takeError();
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*LLVMLinkPath);
-  CmdArgs.push_back("-only-needed");
-  for (auto &File : InputFiles)
-    CmdArgs.push_back(File);
-  CmdArgs.push_back("-o");
-  CmdArgs.push_back(*OutFileOrErr);
-  CmdArgs.push_back("--suppress-warnings");
-  if (Error Err = executeCommands(*LLVMLinkPath, CmdArgs))
-    return std::move(Err);
-  return *OutFileOrErr;
-}
-
-/// This function is used to link all SYCL device input files into a single
-/// LLVM IR file. This file is in turn linked with all SYCL device library
-/// files.
-/// 'InputFiles' is the list of all LLVM IR device input files.
-/// 'Args' encompasses all arguments required for linking and wrapping device
-/// code and will be parsed to generate options required to be passed into the
-/// llvm-link tool.
-static Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
-                                      const ArgList &Args) {
-  SmallVector<StringRef, 16> InputFilesVec;
-  for (StringRef InputFile : InputFiles)
-    InputFilesVec.emplace_back(InputFile);
-  // First llvm-link step.
-  auto LinkedFile = sycl::linkDeviceInputFiles(InputFilesVec, Args);
-  if (!LinkedFile)
-    reportError(LinkedFile.takeError());
-
-  InputFilesVec.clear();
-  InputFilesVec.emplace_back(*LinkedFile);
-
-  // Gathering device library files
-  SmallVector<std::string, 16> DeviceLibFiles;
-  if (Error Err = sycl::getSYCLDeviceLibs(DeviceLibFiles, Args))
-    reportError(std::move(Err));
-  const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
-  SmallVector<std::string, 16> ExtractedDeviceLibFiles;
-  for (auto &File : DeviceLibFiles) {
-    auto BufferOrErr = MemoryBuffer::getFile(File);
-    if (!BufferOrErr)
-      return createFileError(File, BufferOrErr.getError());
-    auto Buffer = std::move(*BufferOrErr);
-    SmallVector<OffloadFile> Binaries;
-    if (Error Err = extractOffloadBinaries(Buffer->getMemBufferRef(), Binaries))
-      return std::move(Err);
-    bool CompatibleBinaryFound = false;
-    for (auto &Binary : Binaries) {
-      auto BinTriple = Binary.getBinary()->getTriple();
-      if (BinTriple == Triple.getTriple()) {
-        auto FileNameOrErr =
-            writeOffloadFile(Binary, true /* HasSYCLOffloadKind */);
-        if (!FileNameOrErr)
-          return FileNameOrErr.takeError();
-        ExtractedDeviceLibFiles.emplace_back(*FileNameOrErr);
-        CompatibleBinaryFound = true;
-      }
-    }
-    if (!CompatibleBinaryFound)
-      WithColor::warning(errs(), LinkerExecutable)
-          << "Compatible SYCL device library binary not found\n";
-  }
-
-  // For NVPTX backend we need to also link libclc and CUDA libdevice.
-  if (Triple.isNVPTX()) {
-    if (Arg *A = Args.getLastArg(OPT_sycl_nvptx_device_lib_EQ)) {
-      if (A->getValues().size() == 0)
-        return createStringError(
-            inconvertibleErrorCode(),
-            "Number of device library files cannot be zero.");
-      for (StringRef Val : A->getValues()) {
-        SmallString<128> LibName(Val);
-        if (llvm::sys::fs::exists(LibName))
-          ExtractedDeviceLibFiles.emplace_back(std::string(LibName));
-        else
-          return createStringError(
-              inconvertibleErrorCode(),
-              std::string(LibName) +
-                  " SYCL device library file for NVPTX is not found.");
-      }
-    }
-  }
-
-  // Make sure that SYCL device library files are available.
-  // Note: For AMD targets, we do not pass any SYCL device libraries.
-  if (ExtractedDeviceLibFiles.empty()) {
-    // TODO: Add NVPTX when ready
-    if (Triple.isSPIROrSPIRV())
-      return createStringError(
-          inconvertibleErrorCode(),
-          " SYCL device library file list cannot be empty.");
-    return *LinkedFile;
-  }
-
-  for (auto &File : ExtractedDeviceLibFiles)
-    InputFilesVec.emplace_back(File);
-  // second llvm-link step
-  auto DeviceLinkedFile = sycl::linkDeviceLibFiles(InputFilesVec, Args);
-  if (!DeviceLinkedFile)
-    reportError(DeviceLinkedFile.takeError());
-
-  return *DeviceLinkedFile;
-}
-
-static bool isStaticArchiveFile(const StringRef Filename) {
-  if (!llvm::sys::path::has_extension(Filename))
-    // Any file with no extension should not be considered an Archive.
-    return false;
-  llvm::file_magic Magic;
-  llvm::identify_magic(Filename, Magic);
-  // Only archive files are to be considered.
-  // TODO: .lib check to be added
-  return (Magic == llvm::file_magic::archive);
-}
-
-static Expected<StringRef> listSection(StringRef Filename,
-                                       const ArgList &Args) {
-  Expected<std::string> OffloadBundlerPath = findProgram(
-      "clang-offload-bundler", {getMainExecutable("clang-offload-bundler")});
-  if (!OffloadBundlerPath)
-    return OffloadBundlerPath.takeError();
-  BumpPtrAllocator Alloc;
-  StringSaver Saver(Alloc);
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*OffloadBundlerPath);
-  bool IsArchive = isStaticArchiveFile(Filename);
-  CmdArgs.push_back(IsArchive ? "-type=aoo" : "-type=o");
-  CmdArgs.push_back(Saver.save("-input=" + Filename));
-  CmdArgs.push_back("-list");
-  auto Output = createOutputFile("bundled-targets", "list");
-  if (!Output)
-    return Output.takeError();
-  SmallVector<std::optional<StringRef>> Redirects{std::nullopt, *Output,
-                                                  std::nullopt};
-  int ErrCode = llvm::sys::ExecuteAndWait(*OffloadBundlerPath, CmdArgs,
-                                          std::nullopt, Redirects);
-  if (ErrCode != 0)
-    return createStringError(inconvertibleErrorCode(),
-                             "Failed to list targets");
-  return *Output;
-}
-
-// This routine is used to run the clang-offload-bundler tool and unbundle
-// device inputs that have been created with an older compiler where the
-// device object is bundled into a host object.
-static Expected<StringRef> unbundle(StringRef Filename, const ArgList &Args,
-                                    llvm::Triple Triple) {
-  Expected<std::string> OffloadBundlerPath = findProgram(
-      "clang-offload-bundler", {getMainExecutable("clang-offload-bundler")});
-  if (!OffloadBundlerPath)
-    return OffloadBundlerPath.takeError();
-
-  // Create a new file to write the unbundled file to.
-  auto TempFileOrErr =
-      createOutputFile(sys::path::filename(ExecutableName), "ir");
-  if (!TempFileOrErr)
-    return TempFileOrErr.takeError();
-
-  BumpPtrAllocator Alloc;
-  StringSaver Saver(Alloc);
-
-  SmallVector<StringRef, 8> CmdArgs;
-  CmdArgs.push_back(*OffloadBundlerPath);
-  bool IsArchive = isStaticArchiveFile(Filename);
-  CmdArgs.push_back(IsArchive ? "-type=aoo" : "-type=o");
-  auto *Target = Args.MakeArgString(Twine("-targets=sycl-") + Triple.str());
-  CmdArgs.push_back(Target);
-  CmdArgs.push_back(Saver.save("-input=" + Filename));
-  CmdArgs.push_back(Saver.save("-output=" + *TempFileOrErr));
-  CmdArgs.push_back("-unbundle");
-  CmdArgs.push_back("-allow-missing-bundles");
-  if (Error Err = executeCommands(*OffloadBundlerPath, CmdArgs))
-    return std::move(Err);
-  return *TempFileOrErr;
-}
-
-Error extractBundledObjects(StringRef Filename, const ArgList &Args,
-                            SmallVector<OffloadFile> &Binaries) {
-  auto List = listSection(Filename, Args);
-  if (!List)
-    return List.takeError();
-  SmallVector<StringRef> TriplesInFile;
-  llvm::ErrorOr<std::unique_ptr<MemoryBuffer>> TripleList =
-      llvm::MemoryBuffer::getFileOrSTDIN(*List, /*isText=*/true);
-  if (std::error_code EC = TripleList.getError())
-    return createFileError(*List, EC);
-  (*TripleList)
-      ->getBuffer()
-      .split(TriplesInFile, '\n', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
-  for (StringRef TripleStr : TriplesInFile) {
-    StringRef SYCLPrefix = "sycl-";
-    if (!TripleStr.starts_with(SYCLPrefix))
-      continue;
-    llvm::Triple Triple(TripleStr.substr(SYCLPrefix.size()));
-    auto UnbundledFile = unbundle(Filename, Args, Triple);
-    if (!UnbundledFile)
-      return UnbundledFile.takeError();
-    if (*UnbundledFile == Filename)
-      continue;
-
-    SmallVector<StringRef> ObjectFilePaths;
-    if (sycl::isStaticArchiveFile(Filename)) {
-      llvm::ErrorOr<std::unique_ptr<MemoryBuffer>> ObjList =
-          llvm::MemoryBuffer::getFileOrSTDIN(*UnbundledFile, /*isText=*/true);
-      if (std::error_code EC = ObjList.getError())
-        return createFileError(*UnbundledFile, EC);
-      // Create a copy of the list we can reference even after we close
-      // the file.
-      StringRef UnbundledArchiveList =
-          Args.MakeArgString((*ObjList)->getBuffer());
-      UnbundledArchiveList.split(ObjectFilePaths, '\n', /*MaxSplit=*/-1,
-                                 /*KeepEmpty=*/false);
-    } else {
-      ObjectFilePaths.push_back(*UnbundledFile);
-    }
-    for (StringRef ObjectFilePath : ObjectFilePaths) {
-      llvm::file_magic Magic;
-      llvm::identify_magic(ObjectFilePath, Magic);
-      if (Magic == file_magic::spirv_object)
-        return createStringError(
-            "SPIR-V fat objects must be generated with --offload-new-driver");
-      const auto *Arg = Args.MakeArgString(
-          "sycl-" +
-          (Triple.isSPIROrSPIRV() ? Triple.str() + "-" : Triple.str()) + "=" +
-          ObjectFilePath);
-      auto Binary = getInputBitcodeLibrary(Arg);
-
-      if (!Binary)
-        return Binary.takeError();
-
-      Binaries.push_back(std::move(*Binary));
-    }
-  }
-  return Error::success();
-}
-
-} // namespace sycl
-
 namespace generic {
 Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
-                          bool IsSYCLKind = false) {
+                          bool HasSYCLOffloadKind = false) {
   llvm::TimeTraceScope TimeScope("Clang");
   // Use `clang` to invoke the appropriate device tools.
   Expected<std::string> ClangPath =
@@ -1506,8 +500,6 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
 
   const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
   StringRef Arch = Args.getLastArgValue(OPT_arch_EQ);
-  if (Arch.empty())
-    Arch = "native";
   // Create a new file to write the linked device image to. Assume that the
   // input filename already has the device and architecture.
   auto TempFileOrErr =
@@ -1517,20 +509,23 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
   if (!TempFileOrErr)
     return TempFileOrErr.takeError();
 
-  StringRef OptLevel = Args.getLastArgValue(OPT_opt_level, "O2");
   SmallVector<StringRef, 16> CmdArgs{
       *ClangPath,
       "--no-default-config",
       "-o",
       *TempFileOrErr,
       Args.MakeArgString("--target=" + Triple.getTriple()),
-      Triple.isAMDGPU() ? Args.MakeArgString("-mcpu=" + Arch)
-                        : Args.MakeArgString("-march=" + Arch),
-      Args.MakeArgString("-" + OptLevel),
   };
 
+  if (!Arch.empty())
+    Triple.isAMDGPU() ? CmdArgs.push_back(Args.MakeArgString("-mcpu=" + Arch))
+                      : CmdArgs.push_back(Args.MakeArgString("-march=" + Arch));
+
+  // AMDGPU is always in LTO mode currently.
+  if (Triple.isAMDGPU())
+    CmdArgs.push_back("-flto");
+
   // Forward all of the `--offload-opt` and similar options to the device.
-  CmdArgs.push_back("-flto");
   for (auto &Arg : Args.filtered(OPT_offload_opt_eq_minus, OPT_mllvm))
     CmdArgs.append(
         {"-Xlinker",
@@ -1539,13 +534,11 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
   if (!Triple.isNVPTX() && !Triple.isSPIRV())
     CmdArgs.push_back("-Wl,--no-undefined");
 
-  if (IsSYCLKind && Triple.isNVPTX())
-    CmdArgs.push_back("-Wl,--lto-emit-asm");
   for (StringRef InputFile : InputFiles)
     CmdArgs.push_back(InputFile);
 
   // If this is CPU offloading we copy the input libraries.
-  if (!Triple.isAMDGPU() && !Triple.isNVPTX() && !Triple.isSPIRV()) {
+  if (!Triple.isGPU()) {
     CmdArgs.push_back("-Wl,-Bsymbolic");
     CmdArgs.push_back("-shared");
     ArgStringList LinkerArgs;
@@ -1581,44 +574,40 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
     CmdArgs.append({"-Xlinker", Args.MakeArgString(
                                     "-mllvm=" + StringRef(Arg->getValue()))});
 
-  if (Args.hasArg(OPT_debug))
-    CmdArgs.push_back("-g");
-
-  if (SaveTemps)
-    CmdArgs.push_back("-save-temps");
-
   if (SaveTemps && linkerSupportsLTO(Args))
     CmdArgs.push_back("-Wl,--save-temps");
 
   if (Args.hasArg(OPT_embed_bitcode))
     CmdArgs.push_back("-Wl,--lto-emit-llvm");
-
+  
   if (Verbose)
     CmdArgs.push_back("-v");
 
-  if (!CudaBinaryPath.empty())
-    CmdArgs.push_back(Args.MakeArgString("--cuda-path=" + CudaBinaryPath));
-
-  for (StringRef Arg : Args.getAllArgValues(OPT_ptxas_arg))
-    llvm::copy(
-        SmallVector<StringRef>({"-Xcuda-ptxas", Args.MakeArgString(Arg)}),
-        std::back_inserter(CmdArgs));
+  if (HasSYCLOffloadKind) {
+    CmdArgs.push_back("--sycl-link");
+    CmdArgs.append(
+        {"-Xlinker", Args.MakeArgString("-triple=" + Triple.getTriple())});
+    CmdArgs.append({"-Xlinker", Args.MakeArgString("-arch=" + Arch)});
+    if (Verbose)
+      CmdArgs.append({"-Xlinker", Args.MakeArgString("--verbose")});
+    if (SaveTemps)
+      CmdArgs.append({"-Xlinker", Args.MakeArgString("-save-temps")});
+    if (DryRun)
+      CmdArgs.append({"-Xlinker", Args.MakeArgString("--dry-run")});
+    StringRef OptLevel = Args.getLastArgValue(OPT_opt_level, "O2");
+    CmdArgs.append({"-Xlinker", Args.MakeArgString("-" + OptLevel)});
+    StringRef GPUArgs = Args.getLastArgValue(OPT_gpu_tool_arg_EQ);
+    CmdArgs.append(
+        {"-Xlinker", Args.MakeArgString("-gpu-tool-arg=" + GPUArgs)});
+    StringRef CPUArgs = Args.getLastArgValue(OPT_cpu_tool_arg_EQ);
+    CmdArgs.append(
+        {"-Xlinker", Args.MakeArgString("-cpu-tool-arg=" + CPUArgs)});
+  }
 
   for (StringRef Arg : Args.getAllArgValues(OPT_linker_arg_EQ))
     CmdArgs.append({"-Xlinker", Args.MakeArgString(Arg)});
   for (StringRef Arg : Args.getAllArgValues(OPT_compiler_arg_EQ))
     CmdArgs.push_back(Args.MakeArgString(Arg));
-
-  for (StringRef Arg : Args.getAllArgValues(OPT_builtin_bitcode_EQ)) {
-    if (llvm::Triple(Arg.split('=').first) == Triple)
-      CmdArgs.append({"-Xclang", "-mlink-builtin-bitcode", "-Xclang",
-                      Args.MakeArgString(Arg.split('=').second)});
-  }
-
-  // The OpenMPOpt pass can introduce new calls and is expensive, we do
-  // not want this when running CodeGen through clang.
-  if (Args.hasArg(OPT_clang_backend) || Args.hasArg(OPT_builtin_bitcode_EQ))
-    CmdArgs.append({"-mllvm", "-openmp-opt-disable"});
 
   if (Error Err = executeCommands(*ClangPath, CmdArgs))
     return std::move(Err);
@@ -1628,7 +617,8 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
 } // namespace generic
 
 Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
-                               const ArgList &Args, bool IsSYCLKind = false) {
+                               const ArgList &Args,
+                               bool HasSYCLOffloadKind = false) {
   const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
   switch (Triple.getArch()) {
   case Triple::nvptx:
@@ -1640,38 +630,10 @@ Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
   case Triple::aarch64_be:
   case Triple::ppc64:
   case Triple::ppc64le:
-  case Triple::systemz:
-    return generic::clang(InputFiles, Args, IsSYCLKind);
-  case Triple::spirv32:
   case Triple::spirv64:
-  case Triple::spir:
-  case Triple::spir64: {
-    if (Triple.getSubArch() != llvm::Triple::NoSubArch &&
-        Triple.getSubArch() != llvm::Triple::SPIRSubArch_gen &&
-        Triple.getSubArch() != llvm::Triple::SPIRSubArch_x86_64)
-      return createStringError(
-          inconvertibleErrorCode(),
-          "For SPIR targets, Linking is supported only for JIT compilations "
-          "and AOT compilations for Intel CPUs/GPUs");
-    if (IsSYCLKind) {
-      auto SPVFile = sycl::runLLVMToSPIRVTranslation(InputFiles[0], Args);
-      if (!SPVFile)
-        return SPVFile.takeError();
-      // TODO(NOM6): Add AOT support for other targets
-      bool NeedAOTCompile =
-          (Triple.getSubArch() == llvm::Triple::SPIRSubArch_gen ||
-           Triple.getSubArch() == llvm::Triple::SPIRSubArch_x86_64);
-      auto AOTFile =
-          (NeedAOTCompile) ? sycl::runAOTCompile(*SPVFile, Args) : *SPVFile;
-      if (!AOTFile)
-        return AOTFile.takeError();
-      return NeedAOTCompile ? *AOTFile : *SPVFile;
-    }
-    // Return empty file
-    return StringRef("");
-  }
+  case Triple::systemz:
   case Triple::loongarch64:
-    return generic::clang(InputFiles, Args);
+    return generic::clang(InputFiles, Args, HasSYCLOffloadKind);
   default:
     return createStringError(Triple.getArchName() +
                              " linking is not supported");
@@ -1683,16 +645,16 @@ Expected<StringRef> linkDevice(ArrayRef<StringRef> InputFiles,
 Expected<StringRef> compileModule(Module &M, OffloadKind Kind) {
   llvm::TimeTraceScope TimeScope("Compile module");
   std::string Msg;
-  const Target *T = TargetRegistry::lookupTarget(M.getTargetTriple(), Msg);
+  llvm::Triple Triple(M.getTargetTriple());
+  const Target *T = TargetRegistry::lookupTarget(Triple.getTriple(), Msg);
   if (!T)
     return createStringError(Msg);
 
-  auto Options =
-      codegen::InitTargetOptionsFromCodeGenFlags(Triple(M.getTargetTriple()));
+  auto Options = codegen::InitTargetOptionsFromCodeGenFlags(Triple);
   StringRef CPU = "";
   StringRef Features = "";
   std::unique_ptr<TargetMachine> TM(
-      T->createTargetMachine(M.getTargetTriple(), CPU, Features, Options,
+      T->createTargetMachine(Triple.getTriple(), CPU, Features, Options,
                              Reloc::PIC_, M.getCodeModel()));
 
   if (M.getDataLayout().isDefault())
@@ -1711,7 +673,7 @@ Expected<StringRef> compileModule(Module &M, OffloadKind Kind) {
   auto OS = std::make_unique<llvm::raw_fd_ostream>(FD, true);
 
   legacy::PassManager CodeGenPasses;
-  TargetLibraryInfoImpl TLII(Triple(M.getTargetTriple()));
+  TargetLibraryInfoImpl TLII(Triple);
   CodeGenPasses.add(new TargetLibraryInfoWrapperPass(TLII));
   if (TM->addPassesToEmitFile(CodeGenPasses, *OS, nullptr,
                               CodeGenFileType::ObjectFile))
@@ -1741,22 +703,19 @@ wrapDeviceImages(ArrayRef<std::unique_ptr<MemoryBuffer>> Buffers,
   switch (Kind) {
   case OFK_OpenMP:
     if (Error Err = offloading::wrapOpenMPBinaries(
-            M, BuffersToWrap,
-            offloading::getOffloadEntryArray(M, "omp_offloading_entries"),
+            M, BuffersToWrap, offloading::getOffloadEntryArray(M),
             /*Suffix=*/"", /*Relocatable=*/Args.hasArg(OPT_relocatable)))
       return std::move(Err);
     break;
   case OFK_Cuda:
     if (Error Err = offloading::wrapCudaBinary(
-            M, BuffersToWrap.front(),
-            offloading::getOffloadEntryArray(M, "cuda_offloading_entries"),
+            M, BuffersToWrap.front(), offloading::getOffloadEntryArray(M),
             /*Suffix=*/"", /*EmitSurfacesAndTextures=*/false))
       return std::move(Err);
     break;
   case OFK_HIP:
     if (Error Err = offloading::wrapHIPBinary(
-            M, BuffersToWrap.front(),
-            offloading::getOffloadEntryArray(M, "hip_offloading_entries")))
+            M, BuffersToWrap.front(), offloading::getOffloadEntryArray(M)))
       return std::move(Err);
     break;
   default:
@@ -1870,18 +829,11 @@ DerivedArgList getLinkerArgs(ArrayRef<OffloadFile> Input,
 
   // Set the subarchitecture and target triple for this compilation.
   const OptTable &Tbl = getOptTable();
+  StringRef Arch = Args.MakeArgString(Input.front().getBinary()->getArch());
   DAL.AddJoinedArg(nullptr, Tbl.getOption(OPT_arch_EQ),
-                   Args.MakeArgString(Input.front().getBinary()->getArch()));
+                   Arch == "generic" ? "" : Arch);
   DAL.AddJoinedArg(nullptr, Tbl.getOption(OPT_triple_EQ),
                    Args.MakeArgString(Input.front().getBinary()->getTriple()));
-
-  const auto *Bin = Input.front().getBinary();
-  DAL.AddJoinedArg(
-      nullptr, Tbl.getOption(OPT_sycl_backend_compile_options_from_image_EQ),
-      Args.MakeArgString(Bin->getString(COMPILE_OPTS)));
-  DAL.AddJoinedArg(nullptr,
-                   Tbl.getOption(OPT_sycl_backend_link_options_from_image_EQ),
-                   Args.MakeArgString(Bin->getString(LINK_OPTS)));
 
   // If every input file is bitcode we have whole program visibility as we
   // do only support static linking with bitcode.
@@ -1968,9 +920,6 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
 
   std::mutex ImageMtx;
   MapVector<OffloadKind, SmallVector<OffloadingImage, 0>> Images;
-  // Create a binary image of each offloading image and embed it into a new
-  // object file.
-  SmallVector<StringRef> WrappedOutput;
 
   // Initialize the images with any overriding inputs.
   if (Args.hasArg(OPT_override_image))
@@ -1990,116 +939,60 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
           reportError(createStringError(Err));
         });
     auto LinkerArgs = getLinkerArgs(Input, BaseArgs);
+
     DenseSet<OffloadKind> ActiveOffloadKinds;
+    // Currently, SYCL device code linking process differs from generic device
+    // code linking.
+    // TODO: Remove check for offload kind, once SYCL device code linking is
+    // aligned with generic linking.
     bool HasSYCLOffloadKind = false;
-    bool HasNonSYCLOffloadKinds = false;
+    bool HasNonSYCLOffloadKind = false;
     for (const auto &File : Input) {
       if (File.getBinary()->getOffloadKind() != OFK_None)
         ActiveOffloadKinds.insert(File.getBinary()->getOffloadKind());
       if (File.getBinary()->getOffloadKind() == OFK_SYCL)
         HasSYCLOffloadKind = true;
       else
-        HasNonSYCLOffloadKinds = true;
+        HasNonSYCLOffloadKind = true;
+    }
+
+    // Write any remaining device inputs to an output file.
+    SmallVector<StringRef> InputFiles;
+    for (const OffloadFile &File : Input) {
+      auto FileNameOrErr = writeOffloadFile(File);
+      if (!FileNameOrErr)
+        return FileNameOrErr.takeError();
+      InputFiles.emplace_back(*FileNameOrErr);
     }
 
     if (HasSYCLOffloadKind) {
-      SmallVector<StringRef> InputFiles;
-      // Write device inputs to an output file for the linker.
-      for (const OffloadFile &File : Input) {
-        auto FileNameOrErr = writeOffloadFile(File, HasSYCLOffloadKind);
-        if (!FileNameOrErr)
-          return FileNameOrErr.takeError();
-        InputFiles.emplace_back(*FileNameOrErr);
-      }
-      // Link the input device files using the device linker for SYCL
-      // offload.
-      auto TmpOutputOrErr = sycl::linkDevice(InputFiles, LinkerArgs);
-      if (!TmpOutputOrErr)
-        return TmpOutputOrErr.takeError();
-      SmallVector<StringRef> InputFilesSYCL;
-      InputFilesSYCL.emplace_back(*TmpOutputOrErr);
-      auto SplitModulesOrErr =
-          UseSYCLPostLinkTool
-              ? sycl::runSYCLPostLinkTool(InputFilesSYCL, LinkerArgs)
-              : sycl::runSYCLSplitLibrary(InputFilesSYCL, LinkerArgs,
-                                          *SYCLModuleSplitMode);
-      if (!SplitModulesOrErr)
-        return SplitModulesOrErr.takeError();
+      // Link the remaining device files using the device linker.
+      auto OutputOrErr = linkDevice(InputFiles, LinkerArgs, HasSYCLOffloadKind);
+      if (!OutputOrErr)
+        return OutputOrErr.takeError();
+      // Output is a packaged object of device images. Unpackage the images and
+      // copy them to Images[Kind]
+      ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
+          MemoryBuffer::getFileOrSTDIN(*OutputOrErr);
+      if (std::error_code EC = BufferOrErr.getError())
+        return createFileError(*OutputOrErr, EC);
 
-      auto &SplitModules = *SplitModulesOrErr;
-      const llvm::Triple Triple(LinkerArgs.getLastArgValue(OPT_triple_EQ));
-      if ((Triple.isNVPTX() || Triple.isAMDGCN()) &&
-          LinkerArgs.hasArg(OPT_sycl_embed_ir)) {
-        // When compiling for Nvidia/AMD devices and the user requested the
-        // IR to be embedded in the application (via option), run the output
-        // of sycl-post-link (filetable referencing LLVM Bitcode + symbols)
-        // through the offload wrapper and link the resulting object to the
-        // application.
-        auto OutputFile = sycl::runWrapperAndCompile(SplitModules, LinkerArgs,
-                                                     /* IsEmbeddedIR */ true);
-        if (!OutputFile)
-          return OutputFile.takeError();
-        WrappedOutput.push_back(*OutputFile);
+      MemoryBufferRef Buffer = **BufferOrErr;
+      SmallVector<OffloadFile> Binaries;
+      if (Error Err = extractOffloadBinaries(Buffer, Binaries))
+        return std::move(Err);
+      for (auto &OffloadFile : Binaries) {
+        auto TheBinary = OffloadFile.getBinary();
+        OffloadingImage TheImage{};
+        TheImage.TheImageKind = TheBinary->getImageKind();
+        TheImage.TheOffloadKind = TheBinary->getOffloadKind();
+        TheImage.StringData["triple"] = TheBinary->getTriple();
+        TheImage.StringData["arch"] = TheBinary->getArch();
+        TheImage.Image = MemoryBuffer::getMemBufferCopy(TheBinary->getImage());
+        Images[OFK_SYCL].emplace_back(std::move(TheImage));
       }
-      for (size_t I = 0, E = SplitModules.size(); I != E; ++I) {
-        SmallVector<StringRef> Files = {SplitModules[I].ModuleFilePath};
-        StringRef Arch = LinkerArgs.getLastArgValue(OPT_arch_EQ);
-        if (Arch.empty())
-          Arch = "native";
-        SmallVector<std::pair<StringRef, StringRef>, 4> BundlerInputFiles;
-        auto ClangOutputOrErr =
-            linkDevice(Files, LinkerArgs, true /* IsSYCLKind */);
-        if (!ClangOutputOrErr)
-          return ClangOutputOrErr.takeError();
-        if (Triple.isNVPTX()) {
-          auto VirtualArch = StringRef(clang::OffloadArchToVirtualArchString(
-              clang::StringToOffloadArch(Arch)));
-          auto PtxasOutputOrErr =
-              nvptx::ptxas(*ClangOutputOrErr, LinkerArgs, Arch);
-          if (!PtxasOutputOrErr)
-            return PtxasOutputOrErr.takeError();
-          BundlerInputFiles.emplace_back(*ClangOutputOrErr, VirtualArch);
-          BundlerInputFiles.emplace_back(*PtxasOutputOrErr, Arch);
-          auto BundledFileOrErr =
-              nvptx::fatbinary(BundlerInputFiles, LinkerArgs);
-          if (!BundledFileOrErr)
-            return BundledFileOrErr.takeError();
-          SplitModules[I].ModuleFilePath = *BundledFileOrErr;
-        } else if (Triple.isAMDGCN()) {
-          BundlerInputFiles.emplace_back(*ClangOutputOrErr, Arch);
-          auto BundledFileOrErr =
-              amdgcn::fatbinary(BundlerInputFiles, LinkerArgs);
-          if (!BundledFileOrErr)
-            return BundledFileOrErr.takeError();
-          SplitModules[I].ModuleFilePath = *BundledFileOrErr;
-        } else {
-          SplitModules[I].ModuleFilePath = *ClangOutputOrErr;
-        }
-      }
-
-      // TODO(NOM7): Remove this call and use community flow for bundle/wrap
-      auto OutputFile = sycl::runWrapperAndCompile(SplitModules, LinkerArgs);
-      if (!OutputFile)
-        return OutputFile.takeError();
-
-      // SYCL offload kind images are all ready to be sent to host linker.
-      // TODO: Currently, device code wrapping for SYCL offload happens in a
-      // separate path inside 'linkDevice' call seen above.
-      // This will eventually be refactored to use the 'common' wrapping logic
-      // that is used for other offload kinds.
-      std::scoped_lock Guard(ImageMtx);
-      WrappedOutput.push_back(*OutputFile);
     }
-    if (HasNonSYCLOffloadKinds) {
-      // Write any remaining device inputs to an output file.
-      SmallVector<StringRef> InputFiles;
-      for (const OffloadFile &File : Input) {
-        auto FileNameOrErr = writeOffloadFile(File);
-        if (!FileNameOrErr)
-          return FileNameOrErr.takeError();
-        InputFiles.emplace_back(*FileNameOrErr);
-      }
-
+    if (HasNonSYCLOffloadKind) {
       // Link the remaining device files using the device linker.
       auto OutputOrErr = linkDevice(InputFiles, LinkerArgs);
       if (!OutputOrErr)
@@ -2107,6 +1000,8 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
 
       // Store the offloading image for each linked output file.
       for (OffloadKind Kind : ActiveOffloadKinds) {
+        if (Kind == OFK_SYCL)
+          continue;
         llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileOrErr =
             llvm::MemoryBuffer::getFileOrSTDIN(*OutputOrErr);
         if (std::error_code EC = FileOrErr.getError()) {
@@ -2135,9 +1030,10 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
   if (Err)
     return std::move(Err);
 
+  // Create a binary image of each offloading image and embed it into a new
+  // object file.
+  SmallVector<StringRef> WrappedOutput;
   for (auto &[Kind, Input] : Images) {
-    if (Kind == OFK_SYCL)
-      continue;
     // We sort the entries before bundling so they appear in a deterministic
     // order in the final binary.
     llvm::sort(Input, [](OffloadingImage &A, OffloadingImage &B) {
@@ -2145,14 +1041,20 @@ Expected<SmallVector<StringRef>> linkAndWrapDeviceFiles(
              A.StringData["arch"] > B.StringData["arch"] ||
              A.TheOffloadKind < B.TheOffloadKind;
     });
-    auto BundledImagesOrErr = bundleLinkedOutput(Input, Args, Kind);
-    if (!BundledImagesOrErr)
-      return BundledImagesOrErr.takeError();
-    auto OutputOrErr = wrapDeviceImages(*BundledImagesOrErr, Args, Kind);
-    if (!OutputOrErr)
-      return OutputOrErr.takeError();
-    WrappedOutput.push_back(*OutputOrErr);
+    if (Kind == OFK_SYCL) {
+      /* Do SYCL specific stuff */
+      WrappedOutput.push_back("dummy");
+    } else {
+      auto BundledImagesOrErr = bundleLinkedOutput(Input, Args, Kind);
+      if (!BundledImagesOrErr)
+        return BundledImagesOrErr.takeError();
+      auto OutputOrErr = wrapDeviceImages(*BundledImagesOrErr, Args, Kind);
+      if (!OutputOrErr)
+        return OutputOrErr.takeError();
+      WrappedOutput.push_back(*OutputOrErr);
+    }
   }
+
   return WrappedOutput;
 }
 
@@ -2224,8 +1126,9 @@ Expected<bool> getSymbolsFromBitcode(MemoryBufferRef Buffer, OffloadKind Kind,
       if (Sym.isFormatSpecific() || !Sym.isGlobal())
         continue;
 
-      bool NewSymbol = Syms.count(Sym.getName()) == 0;
-      auto OldSym = NewSymbol ? Sym_None : Syms[Sym.getName()];
+      auto It = Syms.find(Sym.getName());
+      bool NewSymbol = It == Syms.end();
+      auto OldSym = NewSymbol ? Sym_None : It->second;
 
       // We will extract if it defines a currenlty undefined non-weak
       // symbol.
@@ -2257,6 +1160,7 @@ Expected<bool> getSymbolsFromBitcode(MemoryBufferRef Buffer, OffloadKind Kind,
   // If the file gets extracted we update the table with the new symbols.
   if (ShouldExtract)
     Syms.insert(std::begin(TmpSyms), std::end(TmpSyms));
+  // Syms.insert_range(TmpSyms);
 
   return ShouldExtract;
 }
@@ -2311,6 +1215,7 @@ Expected<bool> getSymbolsFromObject(const ObjectFile &Obj, OffloadKind Kind,
 
   // If the file gets extracted we update the table with the new symbols.
   if (ShouldExtract)
+    // Syms.insert_range(TmpSyms);
     Syms.insert(std::begin(TmpSyms), std::end(TmpSyms));
 
   return ShouldExtract;
@@ -2387,21 +1292,17 @@ getDeviceInput(const ArgList &Args) {
       continue;
 
     ErrorOr<std::unique_ptr<MemoryBuffer>> BufferOrErr =
-        MemoryBuffer::getFile(*Filename);
+        MemoryBuffer::getFileOrSTDIN(*Filename);
     if (std::error_code EC = BufferOrErr.getError())
       return createFileError(*Filename, EC);
 
     MemoryBufferRef Buffer = **BufferOrErr;
     if (identify_magic(Buffer.getBuffer()) == file_magic::elf_shared_object)
       continue;
+
     SmallVector<OffloadFile> Binaries;
-    size_t OldSize = Binaries.size();
     if (Error Err = extractOffloadBinaries(Buffer, Binaries))
       return std::move(Err);
-    if (Binaries.size() == OldSize) {
-      if (Error Err = sycl::extractBundledObjects(*Filename, Args, Binaries))
-        return std::move(Err);
-    }
 
     for (auto &OffloadFile : Binaries) {
       if (identify_magic(Buffer.getBuffer()) == file_magic::archive &&
@@ -2485,13 +1386,6 @@ getDeviceInput(const ArgList &Args) {
       if (Extracted)
         break;
     }
-  }
-
-  for (StringRef Library : Args.getAllArgValues(OPT_bitcode_library_EQ)) {
-    auto FileOrErr = getInputBitcodeLibrary(Library);
-    if (!FileOrErr)
-      return FileOrErr.takeError();
-    InputFiles[*FileOrErr].push_back(std::move(*FileOrErr));
   }
 
   SmallVector<SmallVector<OffloadFile>> InputsForTarget;
@@ -2583,37 +1477,6 @@ int main(int Argc, char **Argv) {
     timeTraceProfilerInitialize(Granularity, Argv[0]);
   }
 
-  UseSYCLPostLinkTool = Args.hasFlag(OPT_use_sycl_post_link_tool,
-                                     OPT_no_use_sycl_post_link_tool, true);
-  if (!UseSYCLPostLinkTool && Args.hasArg(OPT_use_sycl_post_link_tool))
-    reportError(createStringError("-use-sycl-post-link-tool and "
-                                  "-no-use-sycl-post-link-tool options can't "
-                                  "be used together."));
-
-  if (Args.hasArg(OPT_sycl_module_split_mode_EQ)) {
-    if (UseSYCLPostLinkTool)
-      reportError(createStringError(
-          "-sycl-module-split-mode should be used with "
-          "the -no-use-sycl-post-link-tool command line option."));
-
-    StringRef StrMode = Args.getLastArgValue(OPT_sycl_module_split_mode_EQ);
-    SYCLModuleSplitMode = module_split::convertStringToSplitMode(StrMode);
-    if (!SYCLModuleSplitMode)
-      reportError(createStringError(
-          inconvertibleErrorCode(),
-          formatv("sycl-module-split-mode value isn't recognized: {0}",
-                  StrMode)));
-  }
-
-  if (Args.hasArg(OPT_sycl_dump_device_code_EQ)) {
-    Arg *A = Args.getLastArg(OPT_sycl_dump_device_code_EQ);
-    OffloadImageDumpDir = A->getValue();
-    if (OffloadImageDumpDir.empty())
-      sys::path::native(OffloadImageDumpDir = "./");
-    else
-      OffloadImageDumpDir.append(sys::path::get_separator());
-  }
-
   {
     llvm::TimeTraceScope TimeScope("Execute linker wrapper");
 
@@ -2644,5 +1507,6 @@ int main(int Argc, char **Argv) {
     for (const auto &TempFile : TempFiles)
       if (std::error_code EC = sys::fs::remove(TempFile))
         reportError(createFileError(TempFile, EC));
+
   return EXIT_SUCCESS;
 }

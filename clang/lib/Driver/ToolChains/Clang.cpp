@@ -11556,13 +11556,13 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
         }
       }
     }
-    // -sycl-device-libraries=<libs> provides a comma separate list of
+    // -device-libraries=<libs> provides a comma separate list of
     // libraries to add to the device linking step.
     if (LibList.size())
-      CmdArgs.push_back(
-          Args.MakeArgString(Twine("-sycl-device-libraries=") + LibList));
+      CmdArgs.push_back(Args.MakeArgString(
+          Twine("--linker-arg=\"-device-libraries=") + LibList + Twine("\"")));
 
-    // -sycl-device-library-location=<dir> provides the location in which the
+    // -device-library-location=<dir> provides the location in which the
     // SYCL device libraries can be found.
     SmallString<128> DeviceLibDir(D.Dir);
     llvm::sys::path::append(DeviceLibDir, "..", "lib");
@@ -11586,15 +11586,16 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
         break;
       }
     }
-    CmdArgs.push_back(Args.MakeArgString(
-        Twine("-sycl-device-library-location=") + DeviceLibDir));
+    CmdArgs.push_back(
+        Args.MakeArgString(Twine("--linker-arg=\"-device-library-location=") +
+                           DeviceLibDir + Twine("\"")));
 
     if (C.getDriver().isDumpDeviceCodeEnabled()) {
       SmallString<128> DumpDir;
       Arg *A = C.getArgs().getLastArg(options::OPT_fsycl_dump_device_code_EQ);
       DumpDir = A ? A->getValue() : "";
-      CmdArgs.push_back(
-          Args.MakeArgString(Twine("-sycl-dump-device-code=") + DumpDir));
+      CmdArgs.push_back(Args.MakeArgString(
+          Twine("--linker-arg=\"-dump-device-code=") + DumpDir + Twine("\"")));
     }
 
     auto appendOption = [](SmallString<128> &OptString, StringRef AddOpt) {
@@ -11615,7 +11616,8 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
     }
     if (!PostLinkOptString.empty())
       CmdArgs.push_back(
-          Args.MakeArgString("--sycl-post-link-options=" + PostLinkOptString));
+          Args.MakeArgString(Twine("--linker-arg=\"-post-link-options=") +
+                             PostLinkOptString + Twine("\"")));
 
     // --llvm-spirv-options="options" provides a string of options to be passed
     // along to the llvm-spirv (translation) step during device link.
@@ -11628,24 +11630,27 @@ void LinkerWrapper::ConstructJob(Compilation &C, const JobAction &JA,
     getNonTripleBasedSPIRVTransOpts(C, Args, TranslatorArgs);
     for (const auto &A : TranslatorArgs)
       appendOption(OptString, A);
-    CmdArgs.push_back(Args.MakeArgString("--llvm-spirv-options=" + OptString));
-
+    CmdArgs.push_back(
+        Args.MakeArgString(Twine("--linker-arg=\"-llvm-spirv-options=") +
+                           OptString + Twine("\"")));
     if (C.getDefaultToolChain().getTriple().isWindowsMSVCEnvironment())
       CmdArgs.push_back("-sycl-is-windows-msvc-env");
 
     bool IsUsingLTO = D.isUsingOffloadLTO();
     auto LTOMode = D.getOffloadLTOMode();
     if (IsUsingLTO && LTOMode == LTOK_Thin)
-      CmdArgs.push_back(Args.MakeArgString("-sycl-thin-lto"));
+      CmdArgs.push_back(
+          Args.MakeArgString(Twine("--linker-arg=\"-thin-lto\"")));
 
     if (Args.hasArg(options::OPT_fsycl_embed_ir))
-      CmdArgs.push_back(Args.MakeArgString("-sycl-embed-ir"));
+      CmdArgs.push_back(
+          Args.MakeArgString(Twine("--linker-arg=\"-embed-ir\"")));
 
     if (Args.hasFlag(options::OPT_fsycl_allow_device_image_dependencies,
                      options::OPT_fno_sycl_allow_device_image_dependencies,
                      false))
-      CmdArgs.push_back(
-          Args.MakeArgString("-sycl-allow-device-image-dependencies"));
+      CmdArgs.push_back(Args.MakeArgString(
+          Twine("--linker-arg=\"-allow-device-image-dependencies\"")));
 
     // Formulate and add any offload-wrapper and AOT specific options. These
     // are additional options passed in via -Xsycl-target-linker and

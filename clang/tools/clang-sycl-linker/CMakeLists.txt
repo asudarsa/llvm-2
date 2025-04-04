@@ -5,6 +5,8 @@ set(LLVM_LINK_COMPONENTS
   Object
   TargetParser
   Support
+  SYCLLowerIR
+  SYCLPostLink
   )
 
 set(LLVM_TARGET_DEFINITIONS SYCLLinkOpts.td)
