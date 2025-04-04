@@ -17,13 +17,6 @@ def o : JoinedOrSeparate<["-"], "o">, MetaVarName<"<path>">,
 def output : Separate<["--"], "output-file">, Alias<o>, Flags<[HelpHidden]>,
   HelpText<"Alias for -o">;
 
-def library_path_EQ : Joined<["--", "-"], "library-path=">,
-  Flags<[HelpHidden]>, HelpText<"Add <dir> to the library search path">;
-
-def device_libs_EQ : CommaJoined<["--", "-"], "device-libs=">,
-  Flags<[LinkerOnlyOption]>,
-  HelpText<"A comma separated list of device libraries that are linked during the device link.">;
-
 def arch_EQ : Joined<["--", "-"], "arch=">,
               Flags<[LinkerOnlyOption]>,
               MetaVarName<"<arch>">,
@@ -35,15 +28,6 @@ def triple_EQ : Joined<["--", "-"], "triple=">,
 
 def save_temps : Flag<["--", "-"], "save-temps">,
   Flags<[LinkerOnlyOption]>, HelpText<"Save intermediate results">;
-
-def llvm_spirv_path_EQ : Joined<["--"], "llvm-spirv-path=">,
-  Flags<[LinkerOnlyOption]>, MetaVarName<"<dir>">,
-  HelpText<"Set the system llvm-spirv path">;
-
-// Options to pass to llvm-spirv tool
-def llvm_spirv_options_EQ : Joined<["--", "-"], "llvm-spirv-options=">,
-  Flags<[LinkerOnlyOption]>,
-  HelpText<"Options that will control llvm-spirv step">;
 
 def rpath : Separate<["--", "-"], "rpath">;
 def rpath_EQ : Joined<["--", "-"], "rpath=">, Flags<[HelpHidden]>, Alias<rpath>;
@@ -128,44 +112,62 @@ def no_whole_archive : Flag<["--", "-"], "no-whole-archive">, Flags<[HelpHidden]
 def shared : Flag<["--", "-"], "shared">,
     HelpText<"Link device code to create a shared library">;
 
+def library_path : JoinedOrSeparate<["-"], "L">,
+                   MetaVarName<"<dir>">,
+                   HelpText<"Add <dir> to the library search path">;
+def library_path_EQ : Joined<["--", "-"], "library-path=">,
+                      Flags<[HelpHidden]>,
+                      Alias<library_path>;
+
 // Options to specify SYCL device library files
-def sycl_device_lib_EQ : CommaJoined<["--", "-"], "sycl-device-libraries=">,
-  HelpText<"A comma separated list of device libraries that are linked during the device link.">;
-def sycl_device_library_location_EQ : Joined<["--", "-"],
-  "sycl-device-library-location=">,
-  HelpText<"Location of SYCL device library files">;
-def sycl_nvptx_device_lib_EQ : CommaJoined<["--", "-"], "sycl-nvptx-device-libraries=">,
-  HelpText<"A comma separated list of nvptx-specific device libraries that are linked during the device link.">;
+def device_lib_EQ : CommaJoined<["--", "-"], "device-libraries=">,
+                    HelpText<"A comma separated list of device libraries that "
+                             "are linked during the device link.">;
+def device_library_location_EQ
+    : Joined<["--", "-"], "device-library-location=">,
+      HelpText<"Location of SYCL device library files">;
+def nvptx_device_lib_EQ
+    : CommaJoined<["--", "-"], "nvptx-device-libraries=">,
+      HelpText<"A comma separated list of nvptx-specific device libraries that "
+               "are linked during the device link.">;
 
 // Special option to pass in sycl-post-link options
-def sycl_post_link_options_EQ : Joined<["--", "-"], "sycl-post-link-options=">,
-  HelpText<"Options that will control sycl-post-link step">;
+def post_link_options_EQ
+    : Joined<["--", "-"], "post-link-options=">,
+      HelpText<"Options that will control sycl-post-link step">;
 
-def sycl_module_split_mode_EQ :
-  Joined<["--", "-"], "sycl-module-split-mode=">,
-  HelpText<"Option that turns on split library with the given split mode">;
+def module_split_mode_EQ
+    : Joined<["--", "-"], "module-split-mode=">,
+      HelpText<"Option that turns on split library with the given split mode">;
 
 // TODO: Options will be removed when the sycl-post-link tool becomes removed.
-def use_sycl_post_link_tool : Flag<["--", "-"], "use-sycl-post-link-tool">,
-  HelpText<"Use the sycl-post-link tool. On by default">;
+def use_post_link_tool : Flag<["--", "-"], "use-post-link-tool">,
+                         HelpText<"Use the sycl-post-link tool. On by default">;
 
-def no_use_sycl_post_link_tool : Flag<["--", "-"], "no-use-sycl-post-link-tool">,
-  HelpText<"Use a SYCL library instead of sycl-post-link tool. (experimental)">;
+def no_use_post_link_tool
+    : Flag<["--", "-"], "no-use-post-link-tool">,
+      HelpText<
+          "Use a SYCL library instead of sycl-post-link tool. (experimental)">;
 
 // Extra SYCL options to help generate sycl-post-link options that also depend
 // on the target triple.
-def sycl_remove_unused_external_funcs : Flag<["--", "-"], "sycl-remove-unused-external-funcs">,
-  Flags<[HelpHidden]>;
-def no_sycl_remove_unused_external_funcs : Flag<["--", "-"], "no-sycl-remove-unused-external-funcs">,
-  Flags<[HelpHidden]>;
-def sycl_device_code_split_esimd : Flag<["--", "-"], "sycl-device-code-split-esimd">,
-  Flags<[HelpHidden]>;
-def no_sycl_device_code_split_esimd : Flag<["--", "-"], "no-sycl-device-code-split-esimd">,
-  Flags<[HelpHidden]>;
-def sycl_add_default_spec_consts_image : Flag<["--", "-"], "sycl-add-default-spec-consts-image">,
-  Flags<[HelpHidden]>;
-def no_sycl_add_default_spec_consts_image : Flag<["--", "-"], "no-sycl-add-default-spec-consts-image">,
-  Flags<[HelpHidden]>;
+def remove_unused_external_funcs
+    : Flag<["--", "-"], "remove-unused-external-funcs">,
+      Flags<[HelpHidden]>;
+def no_remove_unused_external_funcs
+    : Flag<["--", "-"], "no-remove-unused-external-funcs">,
+      Flags<[HelpHidden]>;
+def device_code_split_esimd : Flag<["--", "-"], "device-code-split-esimd">,
+                              Flags<[HelpHidden]>;
+def no_device_code_split_esimd
+    : Flag<["--", "-"], "no-device-code-split-esimd">,
+      Flags<[HelpHidden]>;
+def add_default_spec_consts_image
+    : Flag<["--", "-"], "add-default-spec-consts-image">,
+      Flags<[HelpHidden]>;
+def no_add_default_spec_consts_image
+    : Flag<["--", "-"], "no-add-default-spec-consts-image">,
+      Flags<[HelpHidden]>;
 
 // Special options to pass backend options required for AOT compilation
 def gpu_tool_arg_EQ :
@@ -177,22 +179,37 @@ def cpu_tool_arg_EQ :
 
 // Hidden options to store backend compile/link options that are stored in
 // device images for SYCL offloading
-def sycl_backend_compile_options_from_image_EQ : Joined<["--", "-"], "sycl-backend-compile-options-from-image=">,
-  HelpText<"Compile options that will be transmitted to the SYCL backend compiler">;
-def sycl_backend_link_options_from_image_EQ : Joined<["--", "-"], "sycl-backend-link-options-from-image=">,
-  HelpText<"Link options that will be transmitted to the SYCL backend compiler">;
+def backend_compile_options_from_image_EQ
+    : Joined<["--", "-"], "backend-compile-options-from-image=">,
+      HelpText<"Compile options that will be transmitted to the SYCL backend "
+               "compiler">;
+def backend_link_options_from_image_EQ
+    : Joined<["--", "-"], "backend-link-options-from-image=">,
+      HelpText<
+          "Link options that will be transmitted to the SYCL backend compiler">;
 
-def sycl_thin_lto : Flag<["--", "-"], "sycl-thin-lto">,
-HelpText<"Link SYCL device code using thinLTO">;
+def thin_lto : Flag<["--", "-"], "thin-lto">,
+               HelpText<"Link SYCL device code using thinLTO">;
 
-def sycl_embed_ir : Flag<["--", "-"], "sycl-embed-ir">,
-HelpText<"Embed LLVM IR for runtime kernel fusion">;
+def embed_ir : Flag<["--", "-"], "embed-ir">,
+               HelpText<"Embed LLVM IR for runtime kernel fusion">;
 
 // Options to enable/disable device dynamic linking.
-def sycl_allow_device_image_dependencies : Flag<["--", "-"], "sycl-allow-device-image-dependencies">,
-  Flags<[HelpHidden]>,
-  HelpText<"Allow dependencies between device code images">;
+def allow_device_image_dependencies
+    : Flag<["--", "-"], "allow-device-image-dependencies">,
+      Flags<[HelpHidden]>,
+      HelpText<"Allow dependencies between device code images">;
 
-def sycl_dump_device_code_EQ
-    : Joined<["--", "-"], "sycl-dump-device-code=">,
-      HelpText<"Directory to dump offloading images to.">;
+def dump_device_code_EQ : Joined<["--", "-"], "dump-device-code=">,
+                          HelpText<"Directory to dump offloading images to.">;
+
+def llvm_spirv_path_EQ : Joined<["--"], "llvm-spirv-path=">,
+                         Flags<[LinkerOnlyOption]>,
+                         MetaVarName<"<dir>">,
+                         HelpText<"Set the system llvm-spirv path">;
+
+// Options to pass to llvm-spirv tool
+def llvm_spirv_options_EQ
+    : Joined<["--", "-"], "llvm-spirv-options=">,
+      Flags<[LinkerOnlyOption]>,
+      HelpText<"Options that will control llvm-spirv step">;

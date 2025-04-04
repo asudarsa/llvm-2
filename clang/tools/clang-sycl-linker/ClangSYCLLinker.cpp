@@ -598,9 +598,9 @@ Expected<StringRef> linkDeviceInputFiles(SmallVectorImpl<StringRef> &InputFiles,
 static Error getSYCLDeviceLibs(SmallVector<std::string, 16> &DeviceLibFiles,
                                const ArgList &Args) {
   StringRef SYCLDeviceLibLoc("");
-  if (Arg *A = Args.getLastArg(OPT_sycl_device_library_location_EQ))
+  if (Arg *A = Args.getLastArg(OPT_device_library_location_EQ))
     SYCLDeviceLibLoc = A->getValue();
-  if (Arg *A = Args.getLastArg(OPT_sycl_device_lib_EQ)) {
+  if (Arg *A = Args.getLastArg(OPT_device_lib_EQ)) {
     if (A->getValues().size() == 0)
       return createStringError(
           inconvertibleErrorCode(),
@@ -706,7 +706,7 @@ static Expected<StringRef> linkDeviceBitcode(ArrayRef<StringRef> InputFiles,
 
   // For NVPTX backend we need to also link libclc and CUDA libdevice.
   if (Triple.isNVPTX()) {
-    if (Arg *A = Args.getLastArg(OPT_sycl_nvptx_device_lib_EQ)) {
+    if (Arg *A = Args.getLastArg(OPT_nvptx_device_lib_EQ)) {
       if (A->getValues().size() == 0)
         return createStringError(
             inconvertibleErrorCode(),
@@ -773,11 +773,11 @@ getTripleBasedSYCLPostLinkOpts(const ArgList &Args,
   // because it only increases amount of code for device compiler to handle,
   // without any actual benefits.
   // TODO: Try to extend this feature for non-Intel GPUs.
-  if ((!Args.hasFlag(OPT_no_sycl_remove_unused_external_funcs,
-                     OPT_sycl_remove_unused_external_funcs, false) &&
+  if ((!Args.hasFlag(OPT_no_remove_unused_external_funcs,
+                     OPT_remove_unused_external_funcs, false) &&
        !SYCLNativeCPU) &&
-      !Args.hasArg(OPT_sycl_allow_device_image_dependencies) &&
-      !Triple.isNVPTX() && !Triple.isAMDGPU())
+      !Args.hasArg(OPT_allow_device_image_dependencies) && !Triple.isNVPTX() &&
+      !Triple.isAMDGPU())
     PostLinkArgs.push_back("-emit-only-kernels-as-entry-points");
 
   if (!Triple.isAMDGCN())
@@ -788,9 +788,9 @@ getTripleBasedSYCLPostLinkOpts(const ArgList &Args,
 
   bool SplitEsimdByDefault = Triple.isSPIROrSPIRV();
   bool SplitEsimd =
-      Args.hasFlag(OPT_sycl_device_code_split_esimd,
-                   OPT_no_sycl_device_code_split_esimd, SplitEsimdByDefault);
-  if (!Args.hasArg(OPT_sycl_thin_lto))
+      Args.hasFlag(OPT_device_code_split_esimd, OPT_no_device_code_split_esimd,
+                   SplitEsimdByDefault);
+  if (!Args.hasArg(OPT_thin_lto))
     PostLinkArgs.push_back("-symbols");
   // Specialization constant info generation is mandatory -
   // add options unconditionally
@@ -801,8 +801,8 @@ getTripleBasedSYCLPostLinkOpts(const ArgList &Args,
   PostLinkArgs.push_back("-lower-esimd");
 
   bool IsAOT = Triple.isNVPTX() || Triple.isAMDGCN() || Triple.isSPIRAOT();
-  if (Args.hasFlag(OPT_sycl_add_default_spec_consts_image,
-                   OPT_no_sycl_add_default_spec_consts_image, false) &&
+  if (Args.hasFlag(OPT_add_default_spec_consts_image,
+                   OPT_no_add_default_spec_consts_image, false) &&
       IsAOT)
     PostLinkArgs.push_back("-generate-device-image-default-spec-consts");
 }
@@ -828,7 +828,7 @@ runSYCLPostLinkTool(ArrayRef<StringRef> InputFiles, const ArgList &Args) {
   SmallVector<StringRef, 8> CmdArgs;
   CmdArgs.push_back(*SYCLPostLinkPath);
   const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
-  Arg *SYCLDeviceLibLoc = Args.getLastArg(OPT_sycl_device_library_location_EQ);
+  Arg *SYCLDeviceLibLoc = Args.getLastArg(OPT_device_library_location_EQ);
   if (SYCLDeviceLibLoc && !Triple.isSPIRAOT()) {
     std::string SYCLDeviceLibLocParam = SYCLDeviceLibLoc->getValue();
     std::string BF16DeviceLibLoc =
@@ -840,7 +840,7 @@ runSYCLPostLinkTool(ArrayRef<StringRef> InputFiles, const ArgList &Args) {
   }
   getTripleBasedSYCLPostLinkOpts(Args, CmdArgs, Triple);
   StringRef SYCLPostLinkOptions;
-  if (Arg *A = Args.getLastArg(OPT_sycl_post_link_options_EQ))
+  if (Arg *A = Args.getLastArg(OPT_post_link_options_EQ))
     SYCLPostLinkOptions = A->getValue();
   SYCLPostLinkOptions.split(CmdArgs, " ", /* MaxSplit = */ -1,
                             /* KeepEmpty = */ false);
@@ -1037,10 +1037,9 @@ static Expected<StringRef> runLLVMToSPIRVTranslation(StringRef File,
 static void addBackendOptions(const ArgList &Args,
                               SmallVector<StringRef, 8> &CmdArgs, bool IsCPU) {
   StringRef OptC =
-      Args.getLastArgValue(OPT_sycl_backend_compile_options_from_image_EQ);
+      Args.getLastArgValue(OPT_backend_compile_options_from_image_EQ);
   OptC.split(CmdArgs, " ", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
-  StringRef OptL =
-      Args.getLastArgValue(OPT_sycl_backend_link_options_from_image_EQ);
+  StringRef OptL = Args.getLastArgValue(OPT_backend_link_options_from_image_EQ);
   OptL.split(CmdArgs, " ", /*MaxSplit=*/-1, /*KeepEmpty=*/false);
   StringRef OptTool = (IsCPU) ? Args.getLastArgValue(OPT_cpu_tool_arg_EQ)
                               : Args.getLastArgValue(OPT_gpu_tool_arg_EQ);
@@ -1236,8 +1235,7 @@ Error runSYCLLink(ArrayRef<StringRef> Files, const ArgList &Args) {
 
     auto &SplitModules = *SplitModulesOrErr;
     const llvm::Triple Triple(Args.getLastArgValue(OPT_triple_EQ));
-    if ((Triple.isNVPTX() || Triple.isAMDGCN()) &&
-        Args.hasArg(OPT_sycl_embed_ir)) {
+    if ((Triple.isNVPTX() || Triple.isAMDGCN()) && Args.hasArg(OPT_embed_ir)) {
       // When compiling for Nvidia/AMD devices and the user requested the
       // IR to be embedded in the application (via option), run the output
       // of sycl-post-link (filetable referencing LLVM Bitcode + symbols)
@@ -1341,20 +1339,20 @@ int main(int argc, char **argv) {
   if (Args.hasArg(OPT_o))
     OutputFile = Args.getLastArgValue(OPT_o);
 
-  UseSYCLPostLinkTool = Args.hasFlag(OPT_use_sycl_post_link_tool,
-                                     OPT_no_use_sycl_post_link_tool, true);
-  if (!UseSYCLPostLinkTool && Args.hasArg(OPT_use_sycl_post_link_tool))
+  UseSYCLPostLinkTool =
+      Args.hasFlag(OPT_use_post_link_tool, OPT_no_use_post_link_tool, true);
+  if (!UseSYCLPostLinkTool && Args.hasArg(OPT_use_post_link_tool))
     reportError(createStringError("-use-sycl-post-link-tool and "
                                   "-no-use-sycl-post-link-tool options can't "
                                   "be used together."));
 
-  if (Args.hasArg(OPT_sycl_module_split_mode_EQ)) {
+  if (Args.hasArg(OPT_module_split_mode_EQ)) {
     if (UseSYCLPostLinkTool)
       reportError(createStringError(
           "-sycl-module-split-mode should be used with "
           "the -no-use-sycl-post-link-tool command line option."));
 
-    StringRef StrMode = Args.getLastArgValue(OPT_sycl_module_split_mode_EQ);
+    StringRef StrMode = Args.getLastArgValue(OPT_module_split_mode_EQ);
     SYCLModuleSplitMode = module_split::convertStringToSplitMode(StrMode);
     if (!SYCLModuleSplitMode)
       reportError(createStringError(
@@ -1363,8 +1361,8 @@ int main(int argc, char **argv) {
                   StrMode)));
   }
 
-  if (Args.hasArg(OPT_sycl_dump_device_code_EQ)) {
-    Arg *A = Args.getLastArg(OPT_sycl_dump_device_code_EQ);
+  if (Args.hasArg(OPT_dump_device_code_EQ)) {
+    Arg *A = Args.getLastArg(OPT_dump_device_code_EQ);
     OffloadImageDumpDir = A->getValue();
     if (OffloadImageDumpDir.empty())
       sys::path::native(OffloadImageDumpDir = "./");

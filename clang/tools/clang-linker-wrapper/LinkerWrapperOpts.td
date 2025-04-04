@@ -92,8 +92,8 @@ def whole_program : Flag<["--"], "whole-program">,
   Flags<[DeviceOnlyOption, HelpHidden]>,
   HelpText<"LTO has visibility of all input files">;
 def linker_arg_EQ : Joined<["--"], "linker-arg=">,
-  Flags<[DeviceOnlyOption, HelpHidden]>,
-  HelpText<"An extra argument to be passed to the linker">;
+                    Flags<[WrapperOnlyOption, DeviceOnlyOption, HelpHidden]>,
+                    HelpText<"An extra argument to be passed to the linker">;
 def compiler_arg_EQ : Joined<["--"], "compiler-arg=">,
   Flags<[DeviceOnlyOption, HelpHidden]>,
   HelpText<"An extra argument to be passed to the compiler">;

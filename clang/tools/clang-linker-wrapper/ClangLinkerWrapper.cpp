@@ -556,11 +556,24 @@ Expected<StringRef> clang(ArrayRef<StringRef> InputFiles, const ArgList &Args,
     CmdArgs.push_back("-Wl,--lto-emit-llvm");
 
   if (HasSYCLOffloadKind) {
-    CmdArgs.push_back("-fsycl");
     CmdArgs.push_back("--sycl-link");
     CmdArgs.append(
         {"-Xlinker", Args.MakeArgString("-triple=" + Triple.getTriple())});
     CmdArgs.append({"-Xlinker", Args.MakeArgString("-arch=" + Arch)});
+    if (Verbose)
+      CmdArgs.append({"-Xlinker", Args.MakeArgString("--verbose")});
+    if (SaveTemps)
+      CmdArgs.append({"-Xlinker", Args.MakeArgString("-save-temps")});
+    if (DryRun)
+      CmdArgs.append({"-Xlinker", Args.MakeArgString("--dry-run")});
+    StringRef OptLevel = Args.getLastArgValue(OPT_opt_level, "O2");
+    CmdArgs.append({"-Xlinker", Args.MakeArgString("-O" + OptLevel)});
+    StringRef GPUArgs = Args.getLastArgValue(OPT_gpu_tool_arg_EQ);
+    CmdArgs.append(
+        {"-Xlinker", Args.MakeArgString("-gpu-tool-arg=" + GPUArgs)});
+    StringRef CPUArgs = Args.getLastArgValue(OPT_cpu_tool_arg_EQ);
+    CmdArgs.append(
+        {"-Xlinker", Args.MakeArgString("-cpu-tool-arg=" + CPUArgs)});
   }
 
   for (StringRef Arg : Args.getAllArgValues(OPT_linker_arg_EQ))
@@ -629,16 +642,16 @@ Expected<StringRef> writeOffloadFile(const OffloadFile &File) {
 Expected<StringRef> compileModule(Module &M, OffloadKind Kind) {
   llvm::TimeTraceScope TimeScope("Compile module");
   std::string Msg;
-  const Target *T = TargetRegistry::lookupTarget(M.getTargetTriple(), Msg);
+  llvm::Triple Triple(M.getTargetTriple());
+  const Target *T = TargetRegistry::lookupTarget(Triple.getTriple(), Msg);
   if (!T)
     return createStringError(Msg);
 
-  auto Options =
-      codegen::InitTargetOptionsFromCodeGenFlags(M.getTargetTriple());
+  auto Options = codegen::InitTargetOptionsFromCodeGenFlags(Triple);
   StringRef CPU = "";
   StringRef Features = "";
   std::unique_ptr<TargetMachine> TM(
-      T->createTargetMachine(M.getTargetTriple(), CPU, Features, Options,
+      T->createTargetMachine(Triple.getTriple(), CPU, Features, Options,
                              Reloc::PIC_, M.getCodeModel()));
 
   if (M.getDataLayout().isDefault())
@@ -657,7 +670,7 @@ Expected<StringRef> compileModule(Module &M, OffloadKind Kind) {
   auto OS = std::make_unique<llvm::raw_fd_ostream>(FD, true);
 
   legacy::PassManager CodeGenPasses;
-  TargetLibraryInfoImpl TLII(M.getTargetTriple());
+  TargetLibraryInfoImpl TLII(Triple);
   CodeGenPasses.add(new TargetLibraryInfoWrapperPass(TLII));
   if (TM->addPassesToEmitFile(CodeGenPasses, *OS, nullptr,
                               CodeGenFileType::ObjectFile))
@@ -681,8 +694,8 @@ wrapDeviceImages(ArrayRef<std::unique_ptr<MemoryBuffer>> Buffers,
 
   LLVMContext Context;
   Module M("offload.wrapper.module", Context);
-  M.setTargetTriple(Triple(
-      Args.getLastArgValue(OPT_host_triple_EQ, sys::getDefaultTargetTriple())));
+  M.setTargetTriple(
+      Args.getLastArgValue(OPT_host_triple_EQ, sys::getDefaultTargetTriple()));
 
   switch (Kind) {
   case OFK_OpenMP:
@@ -1143,7 +1156,8 @@ Expected<bool> getSymbolsFromBitcode(MemoryBufferRef Buffer, OffloadKind Kind,
 
   // If the file gets extracted we update the table with the new symbols.
   if (ShouldExtract)
-    Syms.insert_range(TmpSyms);
+    Syms.insert(std::begin(TmpSyms), std::end(TmpSyms));
+  // Syms.insert_range(TmpSyms);
 
   return ShouldExtract;
 }
@@ -1198,7 +1212,8 @@ Expected<bool> getSymbolsFromObject(const ObjectFile &Obj, OffloadKind Kind,
 
   // If the file gets extracted we update the table with the new symbols.
   if (ShouldExtract)
-    Syms.insert_range(TmpSyms);
+    // Syms.insert_range(TmpSyms);
+    Syms.insert(std::begin(TmpSyms), std::end(TmpSyms));
 
   return ShouldExtract;
 }
